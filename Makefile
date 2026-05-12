@@ -48,7 +48,16 @@ down-macos:
 test-ci:
 	$(COMPOSE) down
 	$(COMPOSE) up -d --build
-	K6_NO_USAGE_REPORT=true $(K6) run $(TEST_DIR)/test.js
+	@set -e; \
+	stats_pid=""; \
+	trap 'if [ -n "$$stats_pid" ]; then kill "$$stats_pid" 2>/dev/null || true; wait "$$stats_pid" 2>/dev/null || true; fi' EXIT INT TERM; \
+	( while :; do \
+		echo "[docker stats]"; \
+		docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" $$($(COMPOSE) ps -q) || true; \
+		sleep 1; \
+	done ) & \
+	stats_pid=$$!; \
+	K6_NO_USAGE_REPORT=true $(K6) run $(TEST_DIR)/test.js; \
 	$(JQ) . $(TEST_DIR)/results.json
 
 test-ci-macos-html:
