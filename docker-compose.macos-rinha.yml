@@ -1,9 +1,0 @@
-services:
-  lb:
-    platform: linux/arm64/v8
-
-  api1:
-    platform: linux/arm64/v8
-
-  api2:
-    platform: linux/arm64/v8

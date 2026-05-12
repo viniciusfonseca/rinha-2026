@@ -1,69 +1,9 @@
 services:
   lb:
     platform: linux/arm64/v8
-    environment:
-      BACKENDS: api1:9999,api2:9999,api3:9999,api4:9999
-    depends_on:
-      - api1
-      - api2
-      - api3
-      - api4
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: "96MB"
 
   api1:
     platform: linux/arm64/v8
-    deploy:
-      resources:
-        limits:
-          cpus: "1.00"
-          memory: "192MB"
 
   api2:
     platform: linux/arm64/v8
-    deploy:
-      resources:
-        limits:
-          cpus: "1.00"
-          memory: "192MB"
-
-  api3:
-    image: rinha-2026-local
-    platform: linux/arm64/v8
-    command: ["/usr/local/bin/fraud_api"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      RINHA_INDEX_PATH: /opt/rinha/index.bin
-    security_opt:
-      - seccomp=unconfined
-    deploy:
-      resources:
-        limits:
-          cpus: "1.00"
-          memory: "192MB"
-    networks:
-      - rinha
-
-  api4:
-    image: rinha-2026-local
-    platform: linux/arm64/v8
-    command: ["/usr/local/bin/fraud_api"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      RINHA_INDEX_PATH: /opt/rinha/index.bin
-    security_opt:
-      - seccomp=unconfined
-    deploy:
-      resources:
-        limits:
-          cpus: "1.00"
-          memory: "192MB"
-    networks:
-      - rinha

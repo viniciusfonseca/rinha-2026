@@ -1,0 +1,182 @@
+# Memoria do Projeto
+
+Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetura atual, o estado valido mais recente, comandos de operacao e armadilhas ja descobertas.
+
+## Resumo Rapido
+
+- Projeto: backend da Rinha 2026 em C.
+- Stack: API HTTP com `io_uring`, load balancer TCP round-robin com `io_uring`, preprocess offline para gerar `index.bin`.
+- Imagem final: `FROM scratch`, contendo apenas `fraud_api`, `fraud_lb` e `/opt/rinha/index.bin`.
+- Ambiente padrao de submissao: `linux/amd64` com `1 CPU` e `350 MB` no total.
+- Ambiente de excecao para desenvolvimento local em Mac: overrides em `docker-compose.macos.yml` e `docker-compose.macos-rinha.yml`, ambos apenas para trocar a plataforma para `linux/arm64/v8`.
+
+## Arquitetura Atual
+
+- [src/api.c](/Users/viniciusfonseca/projects/rinha-2026/src/api.c)
+  - Servidor HTTP em `io_uring`.
+  - Exponibiliza `GET /ready` e `POST /fraud-score`.
+  - Mantem `keep-alive` por padrao, a menos que receba `Connection: close`.
+  - Faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
+
+- [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
+  - Proxy TCP round-robin.
+  - Transparente para HTTP; nao interpreta payload.
+  - Usa identificador com `generation` em `user_data` para descartar CQEs antigos e evitar corrupcao em reuse de sessoes.
+  - Foi ajustado para caber no limite de memoria do LB.
+
+- [src/vectorize.c](/Users/viniciusfonseca/projects/rinha-2026/src/vectorize.c)
+  - Converte o payload da Rinha em vetor de 14 dimensoes.
+
+- [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
+  - Baixa o dataset oficial no build da imagem e gera `index.bin`.
+  - Hoje gera estrutura IVF com centroides, offsets por lista, raios por lista, labels, codigos e vetores quantizados.
+
+- [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
+  - Consulta o `index.bin`.
+  - Estrategia atual: ordenar listas IVF por lower bound e fazer varredura exata por lista, com poda por raio.
+  - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
+
+- [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
+  - Parametros globais do indice e quantizacao.
+  - Estado atual importante:
+    - `RINHA_IVF_NLIST = 512`
+    - `RINHA_IVF_NPROBE = 16`
+    - `RINHA_PQ_M = 7`
+    - `RINHA_PQ_SUBDIM = 2`
+    - `RINHA_PQ_KSUB = 64`
+    - `RINHA_IVF_PQ_RERANK = 8192`
+    - vetores armazenados em `uint16_t` via `rinha_vector_scalar_t`
+
+## Formato do Indice
+
+- Arquivo: [src/index_format.h](/Users/viniciusfonseca/projects/rinha-2026/src/index_format.h)
+- Versao atual:
+  - `RINHA_INDEX_MAGIC = "R26IVF4"`
+  - `RINHA_INDEX_VERSION = 4`
+- Mudancas mais recentes:
+  - inclusao de `list_radii`
+  - armazenamento de vetores em 16 bits
+
+Sempre que mudar o formato serializado, atualizar esse header e regenerar `index.bin`.
+
+## Estado Validado Mais Recente
+
+Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
+
+- compose: `docker-compose.yml` + `docker-compose.macos.yml`
+- plataforma: `linux/arm64/v8`
+- limites preservados do ambiente oficial: `1 CPU` e `350 MB`
+- resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
+  - `p99 = 4.59ms`
+  - `http_errors = 0`
+  - `false_positive_detections = 0`
+  - `false_negative_detections = 1`
+  - `failure_rate = 0%` no relatorio arredondado
+  - `final_score = 5157.54`
+
+Importante:
+- O `0%` de `failure_rate` vem de arredondamento.
+- Ainda existe `1` falso negativo no breakdown.
+
+## Comandos Uteis
+
+- Build local dos binarios:
+  - `make all`
+
+- Subir stack padrao de submissao:
+  - `make up`
+
+- Derrubar stack padrao:
+  - `make down`
+
+- Rodar CI local padrao:
+  - `make test-ci`
+
+- Subir stack em Mac com os mesmos limites da Rinha:
+  - `make up-macos`
+
+- Rodar carga em Mac com os mesmos limites da Rinha:
+  - `make test-ci-macos`
+
+- Rodar smoke manual:
+  - `curl -sS -D - -o /dev/null http://localhost:9999/ready`
+  - `curl -sS -D - -H "Content-Type: application/json" --data-raw @payload.json http://localhost:9999/fraud-score`
+
+## Compose e Ambientes
+
+- [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml)
+  - Base oficial.
+  - `platform: linux/amd64`.
+  - Orcamento total da Rinha dividido entre `lb`, `api1` e `api2`.
+
+- [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
+  - Excecao para desenvolvimento local em Mac.
+  - Usa `linux/arm64/v8`.
+  - Mantem o mesmo desenho de recursos do compose oficial.
+
+- [docker-compose.macos-rinha.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos-rinha.yml)
+  - Override alternativo para Mac com o mesmo objetivo.
+  - Hoje e funcionalmente equivalente ao `docker-compose.macos.yml`.
+
+## Armadilhas Ja Descobertas
+
+- `io_uring` em Docker Desktop no Mac com `linux/amd64` pode falhar em runtime via emulacao.
+  - Para Mac, use os overrides dedicados.
+
+- O `LB` ja estourou memoria quando as sessoes e buffers estavam superdimensionados.
+  - O estado atual foi ajustado para caber no limite.
+  - Nao aumente `LB_MAX_SESSIONS` ou `LB_BUFFER_SIZE` sem revalidar memoria.
+
+- O `LB` ja teve bug de reuse de sessao com CQEs antigos.
+  - Preserve a logica de `generation` em `user_data`.
+
+- A API ja caiu em timeouts quando a busca degenerava para custo alto por request.
+  - Hoje a busca esta mais previsivel com listas ordenadas por lower bound e poda por raio.
+
+- O `README.md` esta desatualizado em partes.
+  - Ele ainda menciona LSH como estrategia principal.
+  - Para o estado atual, confie mais em `src/index.c`, `src/preprocess.c`, `src/common.h` e neste arquivo.
+
+- O build da imagem depende de rede.
+  - [Dockerfile](/Users/viniciusfonseca/projects/rinha-2026/Dockerfile) baixa `references.json.gz` do repositorio oficial durante o build.
+
+## Invariantes Importantes
+
+- A imagem final deve continuar `FROM scratch`.
+- A imagem final deve conter somente:
+  - `/usr/local/bin/fraud_api`
+  - `/usr/local/bin/fraud_lb`
+  - `/opt/rinha/index.bin`
+- `GET /ready` deve responder `204`.
+- `POST /fraud-score` deve responder JSON com `approved` e `fraud_score`.
+- `docker-compose.yml` deve permanecer como baseline `linux/amd64`.
+- O caminho de Mac deve continuar sendo override, nao o padrao.
+
+## Arquivos Mais Importantes
+
+- [Makefile](/Users/viniciusfonseca/projects/rinha-2026/Makefile)
+- [Dockerfile](/Users/viniciusfonseca/projects/rinha-2026/Dockerfile)
+- [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml)
+- [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
+- [docker-compose.macos-rinha.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos-rinha.yml)
+- [src/api.c](/Users/viniciusfonseca/projects/rinha-2026/src/api.c)
+- [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
+- [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
+- [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
+- [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
+- [test/test.js](/Users/viniciusfonseca/projects/rinha-2026/test/test.js)
+- [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json)
+
+## Quando For Mexer No Indice
+
+1. Atualize os parametros em `src/common.h` se necessario.
+2. Se houver mudanca de serializacao, ajuste `src/index_format.h`.
+3. Garanta compatibilidade entre `src/preprocess.c` e `src/index.c`.
+4. Rebuild completo da imagem para regenerar `index.bin`.
+5. Revalide com smoke e com `make test-ci` ou `make test-ci-macos`.
+
+## Proximos Pontos Naturais de Trabalho
+
+- Tentar eliminar o ultimo falso negativo sem reintroduzir timeout.
+- Atualizar o `README.md` para refletir a estrategia atual do indice.
+- Se a qualidade travar novamente, investigar custo/beneficio de armazenar mais informacao por vetor ou refinamento final ainda mais seletivo.
