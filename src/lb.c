@@ -1,0 +1,398 @@
+#include "common.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <liburing.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define LB_PORT 9999
+#define LB_BACKLOG 1024
+#define LB_QUEUE_DEPTH 2048
+/*
+ * The LB container is capped at 48MB. Each session owns two relay buffers, so
+ * overly large per-session state causes the process to OOM as concurrency grows.
+ */
+#define LB_MAX_SESSIONS 1024
+#define LB_BUFFER_SIZE 4096
+#define LB_MAX_BACKENDS 8
+
+typedef enum {
+    LB_OP_ACCEPT = 1,
+    LB_OP_CONNECT = 2,
+    LB_OP_READ = 3,
+    LB_OP_WRITE = 4,
+} lb_op_type_t;
+
+typedef struct {
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+} lb_accept_state_t;
+
+typedef struct {
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+} lb_backend_t;
+
+typedef struct {
+    int client_fd;
+    int backend_fd;
+    bool used;
+    bool connected;
+    uint32_t generation;
+    size_t buffer_len[2];
+    size_t buffer_sent[2];
+    char buffer[2][LB_BUFFER_SIZE];
+} lb_session_t;
+
+static volatile sig_atomic_t lb_running = 1;
+
+static void lb_on_signal(int signo) {
+    (void) signo;
+    lb_running = 0;
+}
+
+static int lb_set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int lb_open_listener(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (lb_set_nonblocking(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0 || listen(fd, LB_BACKLOG) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static uint64_t lb_pack_user_data(lb_op_type_t type, int session_index, int direction, uint32_t generation) {
+    uint64_t packed = (uint64_t) (uint8_t) type;
+    packed |= (uint64_t) (uint16_t) (session_index + 1) << 8;
+    packed |= (uint64_t) (uint8_t) (direction + 1) << 24;
+    packed |= (uint64_t) generation << 32;
+    return packed;
+}
+
+static void lb_unpack_user_data(
+    uint64_t packed,
+    lb_op_type_t *type,
+    int *session_index,
+    int *direction,
+    uint32_t *generation
+) {
+    *type = (lb_op_type_t) (packed & 0xffu);
+    *session_index = (int) (((packed >> 8) & 0xffffu) - 1u);
+    *direction = (int) (((packed >> 24) & 0xffu) - 1u);
+    *generation = (uint32_t) (packed >> 32);
+}
+
+static void lb_close_session(lb_session_t *session) {
+    uint32_t generation = session->generation;
+    if (session->client_fd >= 0) {
+        close(session->client_fd);
+    }
+    if (session->backend_fd >= 0) {
+        close(session->backend_fd);
+    }
+    memset(session, 0, sizeof(*session));
+    session->client_fd = -1;
+    session->backend_fd = -1;
+    session->generation = generation;
+}
+
+static int lb_alloc_session(lb_session_t *sessions) {
+    for (int i = 0; i < LB_MAX_SESSIONS; i++) {
+        if (!sessions[i].used) {
+            uint32_t next_generation = sessions[i].generation + 1u;
+            memset(&sessions[i], 0, sizeof(sessions[i]));
+            sessions[i].used = true;
+            sessions[i].client_fd = -1;
+            sessions[i].backend_fd = -1;
+            sessions[i].generation = next_generation == 0u ? 1u : next_generation;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int lb_submit_accept(struct io_uring *ring, int listen_fd, lb_accept_state_t *state) {
+    state->addr_len = sizeof(state->addr);
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+    io_uring_prep_accept(sqe, listen_fd, (struct sockaddr *) &state->addr, &state->addr_len, 0);
+    io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_ACCEPT, -1, -1, 0));
+    return io_uring_submit(ring);
+}
+
+static int lb_submit_connect(struct io_uring *ring, lb_session_t *session, int session_index, const lb_backend_t *backend) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+    io_uring_prep_connect(sqe, session->backend_fd, (const struct sockaddr *) &backend->addr, backend->addr_len);
+    io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_CONNECT, session_index, -1, session->generation));
+    return io_uring_submit(ring);
+}
+
+static int lb_submit_read(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
+    int fd = direction == 0 ? session->client_fd : session->backend_fd;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+    io_uring_prep_recv(sqe, fd, session->buffer[direction], LB_BUFFER_SIZE, 0);
+    io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_READ, session_index, direction, session->generation));
+    return io_uring_submit(ring);
+}
+
+static int lb_submit_write(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
+    int fd = direction == 0 ? session->backend_fd : session->client_fd;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+    io_uring_prep_send(
+        sqe,
+        fd,
+        session->buffer[direction] + session->buffer_sent[direction],
+        session->buffer_len[direction] - session->buffer_sent[direction],
+        0
+    );
+    io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_WRITE, session_index, direction, session->generation));
+    return io_uring_submit(ring);
+}
+
+static size_t lb_parse_backends(const char *env, lb_backend_t *out) {
+    const char *source = env == NULL ? "api1:9999,api2:9999" : env;
+    char text[256];
+    snprintf(text, sizeof(text), "%s", source);
+
+    size_t count = 0;
+    char *saveptr = NULL;
+    for (char *token = strtok_r(text, ",", &saveptr); token != NULL && count < LB_MAX_BACKENDS; token = strtok_r(NULL, ",", &saveptr)) {
+        char *colon = strrchr(token, ':');
+        if (colon == NULL) {
+            continue;
+        }
+        *colon = '\0';
+        const char *host = token;
+        const char *port = colon + 1;
+
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family = AF_UNSPEC;
+
+        struct addrinfo *result = NULL;
+        if (getaddrinfo(host, port, &hints, &result) != 0) {
+            fprintf(stderr, "falha ao resolver backend %s:%s\n", host, port);
+            continue;
+        }
+
+        memcpy(&out[count].addr, result->ai_addr, result->ai_addrlen);
+        out[count].addr_len = (socklen_t) result->ai_addrlen;
+        freeaddrinfo(result);
+        count++;
+    }
+
+    return count;
+}
+
+int main(void) {
+    signal(SIGINT, lb_on_signal);
+    signal(SIGTERM, lb_on_signal);
+
+    lb_backend_t backends[LB_MAX_BACKENDS];
+    size_t backend_count = lb_parse_backends(getenv("BACKENDS"), backends);
+    if (backend_count < 2u) {
+        fprintf(stderr, "configure ao menos dois backends em BACKENDS\n");
+        return 1;
+    }
+
+    int listen_fd = lb_open_listener(LB_PORT);
+    if (listen_fd < 0) {
+        fprintf(stderr, "falha ao abrir load balancer na porta %d\n", LB_PORT);
+        return 1;
+    }
+
+    struct io_uring ring;
+    if (io_uring_queue_init(LB_QUEUE_DEPTH, &ring, 0) != 0) {
+        fprintf(stderr, "falha ao inicializar io_uring no balanceador\n");
+        close(listen_fd);
+        return 1;
+    }
+
+    lb_session_t *sessions = calloc(LB_MAX_SESSIONS, sizeof(lb_session_t));
+    if (sessions == NULL) {
+        io_uring_queue_exit(&ring);
+        close(listen_fd);
+        return 1;
+    }
+    for (int i = 0; i < LB_MAX_SESSIONS; i++) {
+        sessions[i].client_fd = -1;
+        sessions[i].backend_fd = -1;
+    }
+
+    lb_accept_state_t accept_state;
+    memset(&accept_state, 0, sizeof(accept_state));
+    int accept_rc = lb_submit_accept(&ring, listen_fd, &accept_state);
+    if (accept_rc < 0) {
+        fprintf(stderr, "falha ao submeter accept inicial no io_uring do balanceador: rc=%d\n", accept_rc);
+        free(sessions);
+        io_uring_queue_exit(&ring);
+        close(listen_fd);
+        return 1;
+    }
+
+    size_t next_backend = 0;
+    while (lb_running) {
+        struct io_uring_cqe *cqe = NULL;
+        int wait_rc = io_uring_wait_cqe(&ring, &cqe);
+        if (wait_rc != 0) {
+            if (wait_rc == -EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        uint64_t user_data = io_uring_cqe_get_data64(cqe);
+        lb_op_type_t type;
+        int session_index;
+        int direction;
+        uint32_t generation;
+        int res = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
+
+        lb_unpack_user_data(user_data, &type, &session_index, &direction, &generation);
+
+        if (type == LB_OP_ACCEPT) {
+            if (res >= 0) {
+                int accepted_session_index = lb_alloc_session(sessions);
+                if (accepted_session_index >= 0) {
+                    lb_session_t *session = &sessions[accepted_session_index];
+                    session->client_fd = res;
+                    lb_set_nonblocking(session->client_fd);
+
+                    const lb_backend_t *backend = &backends[next_backend % backend_count];
+                    next_backend++;
+
+                    int backend_fd = socket(((struct sockaddr *) &backend->addr)->sa_family, SOCK_STREAM, 0);
+                    if (backend_fd >= 0 && lb_set_nonblocking(backend_fd) == 0) {
+                        session->backend_fd = backend_fd;
+                        if (lb_submit_connect(&ring, session, accepted_session_index, backend) < 0) {
+                            lb_close_session(session);
+                        }
+                    } else {
+                        if (backend_fd >= 0) {
+                            close(backend_fd);
+                        }
+                        lb_close_session(session);
+                    }
+                } else {
+                    close(res);
+                }
+            }
+            lb_submit_accept(&ring, listen_fd, &accept_state);
+            continue;
+        }
+
+        if (session_index < 0 || session_index >= LB_MAX_SESSIONS) {
+            continue;
+        }
+        lb_session_t *session = &sessions[session_index];
+        if (!session->used || session->generation != generation) {
+            continue;
+        }
+
+        if (type == LB_OP_CONNECT) {
+            if (res < 0) {
+                lb_close_session(session);
+                continue;
+            }
+            session->connected = true;
+            if (lb_submit_read(&ring, session, session_index, 0) < 0
+                || lb_submit_read(&ring, session, session_index, 1) < 0) {
+                lb_close_session(session);
+            }
+            continue;
+        }
+
+        if (type == LB_OP_READ) {
+            if (res <= 0) {
+                lb_close_session(session);
+                continue;
+            }
+
+            session->buffer_len[direction] = (size_t) res;
+            session->buffer_sent[direction] = 0;
+            if (lb_submit_write(&ring, session, session_index, direction) < 0) {
+                lb_close_session(session);
+            }
+            continue;
+        }
+
+        if (type == LB_OP_WRITE) {
+            if (res <= 0) {
+                lb_close_session(session);
+                continue;
+            }
+
+            session->buffer_sent[direction] += (size_t) res;
+            if (session->buffer_sent[direction] < session->buffer_len[direction]) {
+                if (lb_submit_write(&ring, session, session_index, direction) < 0) {
+                    lb_close_session(session);
+                }
+                continue;
+            }
+
+            session->buffer_len[direction] = 0;
+            session->buffer_sent[direction] = 0;
+            if (lb_submit_read(&ring, session, session_index, direction) < 0) {
+                lb_close_session(session);
+            }
+        }
+    }
+
+    for (int i = 0; i < LB_MAX_SESSIONS; i++) {
+        if (sessions[i].used) {
+            lb_close_session(&sessions[i]);
+        }
+    }
+    free(sessions);
+    io_uring_queue_exit(&ring);
+    close(listen_fd);
+    return 0;
+}

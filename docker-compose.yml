@@ -1,0 +1,66 @@
+services:
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rinha-2026-local
+    platform: linux/amd64
+    command: ["/usr/local/bin/fraud_lb"]
+    environment:
+      BACKENDS: api1:9999,api2:9999
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "48MB"
+    networks:
+      - rinha
+
+  api1:
+    image: rinha-2026-local
+    platform: linux/amd64
+    command: ["/usr/local/bin/fraud_api"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      RINHA_INDEX_PATH: /opt/rinha/index.bin
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "151MB"
+    networks:
+      - rinha
+
+  api2:
+    image: rinha-2026-local
+    platform: linux/amd64
+    command: ["/usr/local/bin/fraud_api"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      RINHA_INDEX_PATH: /opt/rinha/index.bin
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "151MB"
+    networks:
+      - rinha
+
+networks:
+  rinha:
+    driver: bridge
