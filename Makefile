@@ -48,7 +48,7 @@ down-macos:
 test-ci:
 	$(COMPOSE) down
 	$(COMPOSE) up -d --build
-	K6_NO_USAGE_REPORT=true $(K6) run $(TEST_DIR)/test.js > /dev/null 2>&1
+	K6_NO_USAGE_REPORT=true $(K6) run $(TEST_DIR)/test.js
 	$(JQ) . $(TEST_DIR)/results.json
 
 test-ci-macos-html:
