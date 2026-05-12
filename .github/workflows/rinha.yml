@@ -10,11 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up k6
         uses: grafana/setup-k6-action@v1
-        with:
-          toolchain: stable
-          override: true
       - name: Run make test-ci
         run: make test-ci
