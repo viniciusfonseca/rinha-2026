@@ -11,8 +11,6 @@ typedef struct {
     float distances[RINHA_IVF_PQ_RERANK];
     uint32_t indices[RINHA_IVF_PQ_RERANK];
     size_t count;
-    size_t worst_slot;
-    float worst_distance;
 } rinha_candidate_set_t;
 
 static float rinha_distance_sq(const float query[RINHA_DIM], const uint8_t *vector) {
@@ -53,39 +51,62 @@ static void rinha_insert_top_ids(
     }
 }
 
-static void rinha_insert_rerank_candidates(
-    rinha_candidate_set_t *set,
-    float distance,
-    uint32_t index
-) {
+static void rinha_candidate_swap(rinha_candidate_set_t *set, size_t lhs, size_t rhs) {
+    float dist = set->distances[lhs];
+    uint32_t index = set->indices[lhs];
+    set->distances[lhs] = set->distances[rhs];
+    set->indices[lhs] = set->indices[rhs];
+    set->distances[rhs] = dist;
+    set->indices[rhs] = index;
+}
+
+static void rinha_candidate_sift_up(rinha_candidate_set_t *set, size_t index) {
+    while (index > 0u) {
+        size_t parent = (index - 1u) >> 1u;
+        if (set->distances[parent] >= set->distances[index]) {
+            break;
+        }
+        rinha_candidate_swap(set, parent, index);
+        index = parent;
+    }
+}
+
+static void rinha_candidate_sift_down(rinha_candidate_set_t *set, size_t index) {
+    for (;;) {
+        size_t left = index * 2u + 1u;
+        if (left >= set->count) {
+            break;
+        }
+
+        size_t largest = left;
+        size_t right = left + 1u;
+        if (right < set->count && set->distances[right] > set->distances[left]) {
+            largest = right;
+        }
+        if (set->distances[index] >= set->distances[largest]) {
+            break;
+        }
+        rinha_candidate_swap(set, index, largest);
+        index = largest;
+    }
+}
+
+static void rinha_insert_rerank_candidates(rinha_candidate_set_t *set, float distance, uint32_t index) {
     if (set->count < RINHA_IVF_PQ_RERANK) {
         size_t slot = set->count++;
         set->distances[slot] = distance;
         set->indices[slot] = index;
-        if (slot == 0u || distance > set->worst_distance) {
-            set->worst_distance = distance;
-            set->worst_slot = slot;
-        }
+        rinha_candidate_sift_up(set, slot);
         return;
     }
 
-    if (distance >= set->worst_distance) {
+    if (distance >= set->distances[0]) {
         return;
     }
 
-    set->distances[set->worst_slot] = distance;
-    set->indices[set->worst_slot] = index;
-
-    size_t worst_slot = 0u;
-    float worst_distance = set->distances[0];
-    for (size_t i = 1; i < set->count; i++) {
-        if (set->distances[i] > worst_distance) {
-            worst_distance = set->distances[i];
-            worst_slot = i;
-        }
-    }
-    set->worst_distance = worst_distance;
-    set->worst_slot = worst_slot;
+    set->distances[0] = distance;
+    set->indices[0] = index;
+    rinha_candidate_sift_down(set, 0u);
 }
 
 static void rinha_insert_top5(
@@ -219,8 +240,6 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
 
     rinha_candidate_set_t rerank = {
         .count = 0u,
-        .worst_slot = 0u,
-        .worst_distance = 0.0f,
     };
 
     for (size_t probe = 0; probe < RINHA_IVF_NPROBE; probe++) {
