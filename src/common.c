@@ -4,16 +4,6 @@
 #include <math.h>
 #include <string.h>
 
-float rinha_clamp01(double value) {
-    if (value <= 0.0) {
-        return 0.0f;
-    }
-    if (value >= 1.0) {
-        return 1.0f;
-    }
-    return (float) value;
-}
-
 uint8_t rinha_quantize_scalar(double value) {
     if (value < 0.0) {
         return 255u;
@@ -24,13 +14,6 @@ uint8_t rinha_quantize_scalar(double value) {
         scaled = 254u;
     }
     return (uint8_t) scaled;
-}
-
-float rinha_dequantize_scalar(uint8_t value) {
-    if (value == 255u) {
-        return -1.0f;
-    }
-    return (float) value / 254.0f;
 }
 
 static uint64_t rinha_xorshift64(uint64_t *state) {

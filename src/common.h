@@ -21,9 +21,19 @@ typedef struct {
     float hyperplanes[RINHA_SIGNATURE_BITS][RINHA_DIM];
 } rinha_lsh_params_t;
 
-float rinha_clamp01(double value);
+static inline float rinha_clamp01(double value) {
+    if (value <= 0.0) {
+        return 0.0f;
+    }
+    if (value >= 1.0) {
+        return 1.0f;
+    }
+    return (float) value;
+}
 uint8_t rinha_quantize_scalar(double value);
-float rinha_dequantize_scalar(uint8_t value);
+static inline float rinha_dequantize_scalar(uint8_t value) {
+    return value == 255u ? -1.0f : (float) value * (1.0f / 254.0f);
+}
 
 void rinha_init_lsh_params(rinha_lsh_params_t *params);
 uint64_t rinha_signature_for_float(const float vector[RINHA_DIM], const rinha_lsh_params_t *params);

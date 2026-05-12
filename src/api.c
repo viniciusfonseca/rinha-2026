@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -53,9 +52,14 @@ typedef struct {
     api_op_t send_op;
 } api_conn_t;
 
+typedef enum {
+    API_ROUTE_INVALID = 0,
+    API_ROUTE_READY = 1,
+    API_ROUTE_FRAUD_SCORE = 2,
+} api_route_t;
+
 typedef struct {
-    char method[8];
-    char path[32];
+    api_route_t route;
     size_t content_length;
     bool keep_alive;
     const char *body;
@@ -104,27 +108,44 @@ static int api_open_listener(uint16_t port) {
     return fd;
 }
 
-static void api_close_conn(api_conn_t *conn) {
+static void api_close_conn(api_conn_t *conn, int conn_index, int *free_slots, size_t *free_count) {
+    bool was_used = conn->used;
     if (conn->fd >= 0) {
         close(conn->fd);
     }
-    memset(conn, 0, sizeof(*conn));
+
     conn->fd = -1;
+    conn->used = false;
+    conn->keep_alive = false;
+    conn->read_len = 0;
+    conn->write_len = 0;
+    conn->write_sent = 0;
+
+    conn->used = false;
+
+    if (was_used && conn_index >= 0) {
+        free_slots[(*free_count)++] = conn_index;
+    }
 }
 
-static int api_alloc_conn(api_conn_t *connections) {
-    for (int i = 0; i < API_MAX_CONNECTIONS; i++) {
-        if (!connections[i].used) {
-            connections[i].used = true;
-            connections[i].fd = -1;
-            connections[i].recv_op.type = API_OP_RECV;
-            connections[i].recv_op.conn_index = i;
-            connections[i].send_op.type = API_OP_SEND;
-            connections[i].send_op.conn_index = i;
-            return i;
-        }
+static int api_alloc_conn(api_conn_t *connections, int *free_slots, size_t *free_count) {
+    if (*free_count == 0) {
+        return -1;
     }
-    return -1;
+
+    int i = free_slots[--(*free_count)];
+    api_conn_t *conn = &connections[i];
+    conn->used = true;
+    conn->fd = -1;
+    conn->keep_alive = false;
+    conn->read_len = 0;
+    conn->write_len = 0;
+    conn->write_sent = 0;
+    conn->recv_op.type = API_OP_RECV;
+    conn->recv_op.conn_index = i;
+    conn->send_op.type = API_OP_SEND;
+    conn->send_op.conn_index = i;
+    return i;
 }
 
 static int api_submit_accept(struct io_uring *ring, int listen_fd, api_accept_state_t *state) {
@@ -166,56 +187,128 @@ static int api_submit_send(struct io_uring *ring, api_conn_t *conn) {
     return io_uring_submit(ring);
 }
 
-static int api_parse_http_request(char *buffer, size_t len, api_request_t *request) {
-    char *header_end = strstr(buffer, "\r\n\r\n");
+static bool api_ascii_ieq(const char *a, const char *b, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ca = (unsigned char) a[i];
+        unsigned char cb = (unsigned char) b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (unsigned char) (ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (unsigned char) (cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *api_copy_str(char *dst, const char *src) {
+    size_t len = strlen(src);
+    memcpy(dst, src, len);
+    return dst + len;
+}
+
+static char *api_write_size(char *dst, size_t value) {
+    char tmp[32];
+    size_t len = 0;
+    do {
+        tmp[len++] = (char) ('0' + (value % 10u));
+        value /= 10u;
+    } while (value > 0u);
+
+    while (len > 0u) {
+        *dst++ = tmp[--len];
+    }
+    return dst;
+}
+
+static int api_parse_http_request(const char *buffer, size_t len, api_request_t *request) {
+    const char *limit = buffer + len;
+    const char *header_end = NULL;
+    for (const char *p = buffer; p + 3 < limit; p++) {
+        if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
+            header_end = p;
+            break;
+        }
+    }
     if (header_end == NULL) {
         return 0;
     }
 
-    size_t header_len = (size_t) ((header_end + 4) - buffer);
-    char *line_end = strstr(buffer, "\r\n");
+    const char *line_end = NULL;
+    for (const char *p = buffer; p + 1 < header_end; p++) {
+        if (p[0] == '\r' && p[1] == '\n') {
+            line_end = p;
+            break;
+        }
+    }
     if (line_end == NULL) {
         return -1;
     }
 
-    char request_line[128];
-    size_t request_line_len = (size_t) (line_end - buffer);
-    if (request_line_len >= sizeof(request_line)) {
-        return -1;
-    }
-    memcpy(request_line, buffer, request_line_len);
-    request_line[request_line_len] = '\0';
-
-    if (sscanf(request_line, "%7s %31s", request->method, request->path) != 2) {
-        return -1;
-    }
-
+    request->route = API_ROUTE_INVALID;
     request->content_length = 0;
     request->keep_alive = true;
 
-    char *cursor = line_end + 2;
+    const char *sp1 = memchr(buffer, ' ', (size_t) (line_end - buffer));
+    if (sp1 == NULL) {
+        return -1;
+    }
+    const char *sp2 = memchr(sp1 + 1, ' ', (size_t) (line_end - (sp1 + 1)));
+    if (sp2 == NULL) {
+        return -1;
+    }
+
+    size_t method_len = (size_t) (sp1 - buffer);
+    size_t path_len = (size_t) (sp2 - (sp1 + 1));
+    if (method_len == 3 && memcmp(buffer, "GET", 3) == 0 && path_len == 6 && memcmp(sp1 + 1, "/ready", 6) == 0) {
+        request->route = API_ROUTE_READY;
+    } else if (method_len == 4 && memcmp(buffer, "POST", 4) == 0 && path_len == 12 && memcmp(sp1 + 1, "/fraud-score", 12) == 0) {
+        request->route = API_ROUTE_FRAUD_SCORE;
+    }
+
+    const char *cursor = line_end + 2;
     while (cursor < header_end) {
-        char *next = strstr(cursor, "\r\n");
-        if (next == NULL) {
+        const char *next = cursor;
+        while (next + 1 < header_end && !(next[0] == '\r' && next[1] == '\n')) {
+            next++;
+        }
+        if (next + 1 >= header_end) {
             return -1;
         }
 
-        if ((size_t) (next - cursor) >= 15 && strncasecmp(cursor, "Content-Length:", 15) == 0) {
-            request->content_length = (size_t) strtoull(cursor + 15, NULL, 10);
-        } else if ((size_t) (next - cursor) >= 11 && strncasecmp(cursor, "Connection:", 11) == 0) {
-            const char *value = cursor + 11;
-            while (value < next && (*value == ' ' || *value == '\t')) {
+        const char *colon = memchr(cursor, ':', (size_t) (next - cursor));
+        if (colon == NULL) {
+            return -1;
+        }
+
+        size_t name_len = (size_t) (colon - cursor);
+        const char *value = colon + 1;
+        while (value < next && (*value == ' ' || *value == '\t')) {
+            value++;
+        }
+
+        if (name_len == 14 && api_ascii_ieq(cursor, "Content-Length", 14)) {
+            size_t content_length = 0;
+            while (value < next && *value >= '0' && *value <= '9') {
+                content_length = content_length * 10u + (size_t) (*value - '0');
                 value++;
             }
-            if ((size_t) (next - value) == 5 && strncasecmp(value, "close", 5) == 0) {
+            request->content_length = content_length;
+        } else if (name_len == 10 && api_ascii_ieq(cursor, "Connection", 10)) {
+            size_t value_len = (size_t) (next - value);
+            if (value_len == 5 && api_ascii_ieq(value, "close", 5)) {
                 request->keep_alive = false;
             }
         }
+
         cursor = next + 2;
     }
 
     request->body = header_end + 4;
-    request->total_length = header_len + request->content_length;
+    request->total_length = (size_t) ((header_end + 4) - buffer) + request->content_length;
     if (len < request->total_length) {
         return 0;
     }
@@ -229,49 +322,51 @@ static void api_prepare_response(
     const char *body,
     bool keep_alive
 ) {
-    size_t body_len = body == NULL ? 0u : strlen(body);
     const char *connection = keep_alive ? "keep-alive" : "close";
-    conn->write_len = (size_t) snprintf(
-        conn->write_buf,
-        sizeof(conn->write_buf),
-        "HTTP/1.1 %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: %s\r\n"
-        "\r\n"
-        "%s",
-        status,
-        content_type,
-        body_len,
-        connection,
-        body == NULL ? "" : body
-    );
+    char *p = conn->write_buf;
+    char *end = conn->write_buf + sizeof(conn->write_buf);
+    size_t body_len = body == NULL ? 0u : strlen(body);
+
+    p = api_copy_str(p, "HTTP/1.1 ");
+    p = api_copy_str(p, status);
+    p = api_copy_str(p, "\r\nContent-Type: ");
+    p = api_copy_str(p, content_type);
+    p = api_copy_str(p, "\r\nContent-Length: ");
+    p = api_write_size(p, body_len);
+    p = api_copy_str(p, "\r\nConnection: ");
+    p = api_copy_str(p, connection);
+    p = api_copy_str(p, "\r\n\r\n");
+
+    if (body_len > 0u) {
+        if (p + body_len > end) {
+            body_len = (size_t) (end - p);
+        }
+        memcpy(p, body == NULL ? "" : body, body_len);
+        p += body_len;
+    }
+
+    conn->write_len = (size_t) (p - conn->write_buf);
     conn->write_sent = 0;
     conn->keep_alive = keep_alive;
 }
 
 static void api_prepare_no_content(api_conn_t *conn, bool keep_alive) {
-    const char *connection = keep_alive ? "keep-alive" : "close";
-    conn->write_len = (size_t) snprintf(
-        conn->write_buf,
-        sizeof(conn->write_buf),
-        "HTTP/1.1 204 No Content\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        connection
-    );
+    char *p = conn->write_buf;
+    p = api_copy_str(p, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: ");
+    p = api_copy_str(p, keep_alive ? "keep-alive" : "close");
+    p = api_copy_str(p, "\r\n\r\n");
+    conn->write_len = (size_t) (p - conn->write_buf);
     conn->write_sent = 0;
     conn->keep_alive = keep_alive;
 }
 
 static void api_handle_business(api_conn_t *conn, const api_request_t *request, rinha_index_t *index) {
-    if (strcmp(request->method, "GET") == 0 && strcmp(request->path, "/ready") == 0) {
+    if (request->route == API_ROUTE_READY) {
         api_prepare_no_content(conn, request->keep_alive);
         return;
     }
 
-    if (strcmp(request->method, "POST") != 0 || strcmp(request->path, "/fraud-score") != 0) {
+    if (request->route != API_ROUTE_FRAUD_SCORE) {
         api_prepare_response(conn, "404 Not Found", "text/plain", "not found", false);
         return;
     }
@@ -287,13 +382,14 @@ static void api_handle_business(api_conn_t *conn, const api_request_t *request, 
     bool approved = fraud_score < 0.6f;
 
     char body[96];
-    snprintf(
-        body,
-        sizeof(body),
-        "{\"approved\":%s,\"fraud_score\":%.1f}",
-        approved ? "true" : "false",
-        fraud_score
-    );
+    static const char *const score_texts[] = {"0.0", "0.2", "0.4", "0.6", "0.8", "1.0"};
+    char *p = body;
+    p = api_copy_str(p, "{\"approved\":");
+    p = api_copy_str(p, approved ? "true" : "false");
+    p = api_copy_str(p, ",\"fraud_score\":");
+    p = api_copy_str(p, score_texts[fraud_count]);
+    p = api_copy_str(p, "}");
+    *p = '\0';
     api_prepare_response(conn, "200 OK", "application/json", body, request->keep_alive);
 }
 
@@ -328,7 +424,10 @@ int main(void) {
     }
 
     api_conn_t *connections = calloc(API_MAX_CONNECTIONS, sizeof(api_conn_t));
-    if (connections == NULL) {
+    int *free_slots = malloc((size_t) API_MAX_CONNECTIONS * sizeof(int));
+    if (connections == NULL || free_slots == NULL) {
+        free(connections);
+        free(free_slots);
         io_uring_queue_exit(&ring);
         close(listen_fd);
         rinha_index_close(&index);
@@ -336,7 +435,9 @@ int main(void) {
     }
     for (int i = 0; i < API_MAX_CONNECTIONS; i++) {
         connections[i].fd = -1;
+        free_slots[i] = API_MAX_CONNECTIONS - 1 - i;
     }
+    size_t free_count = API_MAX_CONNECTIONS;
 
     api_accept_state_t accept_state;
     memset(&accept_state, 0, sizeof(accept_state));
@@ -370,17 +471,13 @@ int main(void) {
 
         if (op->type == API_OP_ACCEPT) {
             if (res >= 0) {
-                int conn_index = api_alloc_conn(connections);
+                int conn_index = api_alloc_conn(connections, free_slots, &free_count);
                 if (conn_index >= 0) {
                     api_conn_t *conn = &connections[conn_index];
                     conn->fd = res;
-                    conn->read_len = 0;
-                    conn->write_len = 0;
-                    conn->write_sent = 0;
-                    conn->keep_alive = true;
                     api_set_nonblocking(conn->fd);
                     if (api_submit_recv(&ring, conn) < 0) {
-                        api_close_conn(conn);
+                        api_close_conn(conn, conn_index, free_slots, &free_count);
                     }
                 } else {
                     close(res);
@@ -397,7 +494,7 @@ int main(void) {
 
         if (op->type == API_OP_RECV) {
             if (res <= 0) {
-                api_close_conn(conn);
+                api_close_conn(conn, op->conn_index, free_slots, &free_count);
                 continue;
             }
 
@@ -428,7 +525,7 @@ int main(void) {
 
         if (op->type == API_OP_SEND) {
             if (res <= 0) {
-                api_close_conn(conn);
+                api_close_conn(conn, op->conn_index, free_slots, &free_count);
                 continue;
             }
 
@@ -439,7 +536,7 @@ int main(void) {
             }
 
             if (!conn->keep_alive) {
-                api_close_conn(conn);
+                api_close_conn(conn, op->conn_index, free_slots, &free_count);
                 continue;
             }
 
@@ -452,10 +549,11 @@ int main(void) {
 
     for (int i = 0; i < API_MAX_CONNECTIONS; i++) {
         if (connections[i].used) {
-            api_close_conn(&connections[i]);
+            api_close_conn(&connections[i], i, free_slots, &free_count);
         }
     }
     free(connections);
+    free(free_slots);
     io_uring_queue_exit(&ring);
     close(listen_fd);
     rinha_index_close(&index);

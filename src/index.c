@@ -93,17 +93,28 @@ void rinha_index_close(rinha_index_t *index) {
     memset(index, 0, sizeof(*index));
 }
 
-static void rinha_collect_bucket(rinha_index_t *index, size_t table, uint16_t key, size_t *candidate_count) {
-    size_t base = table * (RINHA_BUCKET_COUNT + 1u);
-    uint32_t start = index->bucket_offsets[base + key];
-    uint32_t end = index->bucket_offsets[base + key + 1u];
+static void rinha_collect_bucket(
+    rinha_index_t *index,
+    size_t table,
+    uint16_t key,
+    size_t *candidate_count
+) {
+    const uint32_t *bucket_offsets = index->bucket_offsets;
+    const uint32_t *indices = index->indices;
+    uint32_t *visited = index->visited;
+    uint32_t generation = index->generation;
+    size_t point_base = table * index->point_count;
+    size_t bucket_base = table * (RINHA_BUCKET_COUNT + 1u);
+
+    uint32_t start = bucket_offsets[bucket_base + key];
+    uint32_t end = bucket_offsets[bucket_base + key + 1u];
 
     for (uint32_t i = start; i < end; i++) {
-        uint32_t point = index->indices[table * index->point_count + i];
-        if (index->visited[point] == index->generation) {
+        uint32_t point = indices[point_base + i];
+        if (visited[point] == generation) {
             continue;
         }
-        index->visited[point] = index->generation;
+        visited[point] = generation;
         if (*candidate_count < index->candidate_cap) {
             index->candidates[(*candidate_count)++] = point;
         }
@@ -111,9 +122,10 @@ static void rinha_collect_bucket(rinha_index_t *index, size_t table, uint16_t ke
 }
 
 static void rinha_collect_candidates(rinha_index_t *index, uint64_t signature, size_t *candidate_count) {
+    uint16_t keys[RINHA_TABLE_COUNT];
     for (size_t table = 0; table < RINHA_TABLE_COUNT; table++) {
-        uint16_t key = rinha_table_key(signature, &index->params, table);
-        rinha_collect_bucket(index, table, key, candidate_count);
+        keys[table] = rinha_table_key(signature, &index->params, table);
+        rinha_collect_bucket(index, table, keys[table], candidate_count);
     }
 
     if (*candidate_count >= 64u) {
@@ -121,9 +133,8 @@ static void rinha_collect_candidates(rinha_index_t *index, uint64_t signature, s
     }
 
     for (size_t table = 0; table < RINHA_TABLE_COUNT; table++) {
-        uint16_t key = rinha_table_key(signature, &index->params, table);
         for (size_t bit = 0; bit < RINHA_BUCKET_BITS; bit++) {
-            uint16_t probe = (uint16_t) (key ^ (1u << bit));
+            uint16_t probe = (uint16_t) (keys[table] ^ (1u << bit));
             rinha_collect_bucket(index, table, probe, candidate_count);
         }
     }
@@ -133,10 +144,9 @@ static void rinha_collect_candidates(rinha_index_t *index, uint64_t signature, s
     }
 
     for (size_t table = 0; table < RINHA_TABLE_COUNT; table++) {
-        uint16_t key = rinha_table_key(signature, &index->params, table);
         for (size_t bit_a = 0; bit_a < RINHA_BUCKET_BITS; bit_a++) {
             for (size_t bit_b = bit_a + 1u; bit_b < RINHA_BUCKET_BITS; bit_b++) {
-                uint16_t probe = (uint16_t) (key ^ (1u << bit_a) ^ (1u << bit_b));
+                uint16_t probe = (uint16_t) (keys[table] ^ (1u << bit_a) ^ (1u << bit_b));
                 rinha_collect_bucket(index, table, probe, candidate_count);
             }
         }
