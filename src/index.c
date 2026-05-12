@@ -7,6 +7,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+typedef struct {
+    float distances[RINHA_IVF_PQ_RERANK];
+    uint32_t indices[RINHA_IVF_PQ_RERANK];
+    size_t count;
+    size_t worst_slot;
+    float worst_distance;
+} rinha_candidate_set_t;
+
 static float rinha_distance_sq(const float query[RINHA_DIM], const uint8_t *vector) {
     float sum = 0.0f;
     for (size_t dim = 0; dim < RINHA_DIM; dim++) {
@@ -46,23 +54,38 @@ static void rinha_insert_top_ids(
 }
 
 static void rinha_insert_rerank_candidates(
-    float best_dist[RINHA_IVF_PQ_RERANK],
-    uint32_t best_index[RINHA_IVF_PQ_RERANK],
+    rinha_candidate_set_t *set,
     float distance,
     uint32_t index
 ) {
-    for (size_t i = 0; i < RINHA_IVF_PQ_RERANK; i++) {
-        if (distance >= best_dist[i]) {
-            continue;
+    if (set->count < RINHA_IVF_PQ_RERANK) {
+        size_t slot = set->count++;
+        set->distances[slot] = distance;
+        set->indices[slot] = index;
+        if (slot == 0u || distance > set->worst_distance) {
+            set->worst_distance = distance;
+            set->worst_slot = slot;
         }
-        for (size_t j = RINHA_IVF_PQ_RERANK - 1u; j > i; j--) {
-            best_dist[j] = best_dist[j - 1u];
-            best_index[j] = best_index[j - 1u];
-        }
-        best_dist[i] = distance;
-        best_index[i] = index;
-        break;
+        return;
     }
+
+    if (distance >= set->worst_distance) {
+        return;
+    }
+
+    set->distances[set->worst_slot] = distance;
+    set->indices[set->worst_slot] = index;
+
+    size_t worst_slot = 0u;
+    float worst_distance = set->distances[0];
+    for (size_t i = 1; i < set->count; i++) {
+        if (set->distances[i] > worst_distance) {
+            worst_distance = set->distances[i];
+            worst_slot = i;
+        }
+    }
+    set->worst_distance = worst_distance;
+    set->worst_slot = worst_slot;
 }
 
 static void rinha_insert_top5(
@@ -176,6 +199,7 @@ static void rinha_build_distance_table(
             residual[dim] = query[dim_base + dim] - centroid[dim_base + dim];
         }
 
+        float *subtable = table[subspace];
         for (size_t code = 0; code < RINHA_PQ_KSUB; code++) {
             const float *codeword = index->pq_codebooks +
                 ((subspace * RINHA_PQ_KSUB + code) * RINHA_PQ_SUBDIM);
@@ -184,7 +208,7 @@ static void rinha_build_distance_table(
                 float diff = residual[dim] - codeword[dim];
                 distance += diff * diff;
             }
-            table[subspace][code] = distance;
+            subtable[code] = distance;
         }
     }
 }
@@ -193,12 +217,11 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     uint32_t selected_lists[RINHA_IVF_NPROBE];
     rinha_select_lists(index, query, selected_lists);
 
-    float rerank_best_dist[RINHA_IVF_PQ_RERANK];
-    uint32_t rerank_best_index[RINHA_IVF_PQ_RERANK];
-    for (size_t i = 0; i < RINHA_IVF_PQ_RERANK; i++) {
-        rerank_best_dist[i] = FLT_MAX;
-        rerank_best_index[i] = 0u;
-    }
+    rinha_candidate_set_t rerank = {
+        .count = 0u,
+        .worst_slot = 0u,
+        .worst_distance = 0.0f,
+    };
 
     for (size_t probe = 0; probe < RINHA_IVF_NPROBE; probe++) {
         uint32_t list = selected_lists[probe];
@@ -210,24 +233,32 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
 
         float distance_table[RINHA_PQ_M][RINHA_PQ_KSUB];
         rinha_build_distance_table(index, query, list, distance_table);
+        const float *table0 = distance_table[0];
+        const float *table1 = distance_table[1];
+        const float *table2 = distance_table[2];
+        const float *table3 = distance_table[3];
+        const float *table4 = distance_table[4];
+        const float *table5 = distance_table[5];
+        const float *table6 = distance_table[6];
 
+        const uint8_t *code = index->codes + (size_t) start * RINHA_PQ_M;
         for (uint32_t item = start; item < end; item++) {
-            const uint8_t *code = index->codes + (size_t) item * RINHA_PQ_M;
-            float distance = 0.0f;
-            for (size_t subspace = 0; subspace < RINHA_PQ_M; subspace++) {
-                distance += distance_table[subspace][code[subspace]];
-            }
-            rinha_insert_rerank_candidates(rerank_best_dist, rerank_best_index, distance, item);
+            float distance = table0[code[0]] +
+                             table1[code[1]] +
+                             table2[code[2]] +
+                             table3[code[3]] +
+                             table4[code[4]] +
+                             table5[code[5]] +
+                             table6[code[6]];
+            rinha_insert_rerank_candidates(&rerank, distance, item);
+            code += RINHA_PQ_M;
         }
     }
 
     float best_dist[5] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
     uint8_t best_label[5] = {0u, 0u, 0u, 0u, 0u};
-    for (size_t i = 0; i < RINHA_IVF_PQ_RERANK; i++) {
-        if (rerank_best_dist[i] == FLT_MAX) {
-            break;
-        }
-        uint32_t item = rerank_best_index[i];
+    for (size_t i = 0; i < rerank.count; i++) {
+        uint32_t item = rerank.indices[i];
         const uint8_t *vector = index->vectors + (size_t) item * RINHA_DIM;
         float distance = rinha_distance_sq(query, vector);
         rinha_insert_top5(best_dist, best_label, distance, index->labels[item]);
