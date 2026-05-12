@@ -121,8 +121,6 @@ static void api_close_conn(api_conn_t *conn, int conn_index, int *free_slots, si
     conn->write_len = 0;
     conn->write_sent = 0;
 
-    conn->used = false;
-
     if (was_used && conn_index >= 0) {
         free_slots[(*free_count)++] = conn_index;
     }
@@ -272,10 +270,10 @@ static int api_parse_http_request(const char *buffer, size_t len, api_request_t 
     const char *cursor = line_end + 2;
     while (cursor < header_end) {
         const char *next = cursor;
-        while (next + 1 < header_end && !(next[0] == '\r' && next[1] == '\n')) {
+        while (next < header_end && !(next[0] == '\r' && next[1] == '\n')) {
             next++;
         }
-        if (next + 1 >= header_end) {
+        if (next > header_end || next[0] != '\r' || next[1] != '\n') {
             return -1;
         }
 

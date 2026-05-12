@@ -51,7 +51,7 @@ test-ci:
 	K6_NO_USAGE_REPORT=true $(K6) run $(TEST_DIR)/test.js > /dev/null 2>&1
 	$(JQ) . $(TEST_DIR)/results.json
 
-test-ci-macos:
+test-ci-macos-html:
 	$(COMPOSE_MACOS) down
 	$(COMPOSE_MACOS) up -d --build
 	K6_WEB_DASHBOARD=true \
@@ -60,6 +60,12 @@ test-ci-macos:
 	K6_WEB_DASHBOARD_OPEN=true \
 	K6_WEB_DASHBOARD_EXPORT=report.html \
 	$(K6) run $(TEST_DIR)/test.js
+	$(JQ) . $(TEST_DIR)/results.json
+
+test-ci-macos:
+	$(COMPOSE_MACOS) down
+	$(COMPOSE_MACOS) up -d --build
+	K6_NO_USAGE_REPORT=true $(K6) run $(TEST_DIR)/test.js > /dev/null 2>&1
 	$(JQ) . $(TEST_DIR)/results.json
 
 run-test: test
