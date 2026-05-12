@@ -69,12 +69,14 @@ static bool rinha_cpu_has_avx2(void) {
     return has_avx2;
 }
 
+__attribute__((target("avx2")))
 static float rinha_reduce_m256(__m256 value) {
     float lanes[8];
     _mm256_storeu_ps(lanes, value);
     return lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
 }
 
+__attribute__((target("avx2")))
 static float rinha_reduce_m128(__m128 value) {
     float lanes[4];
     _mm_storeu_ps(lanes, value);
