@@ -8,12 +8,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 typedef struct {
     float centroid_dist_sq;
     uint32_t list;
 } rinha_list_bound_t;
 
-static float rinha_distance_sq(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+static float rinha_distance_sq_scalar(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
     float diff0 = query[0] - decode[vector[0]];
     float diff1 = query[1] - decode[vector[1]];
     float diff2 = query[2] - decode[vector[2]];
@@ -44,13 +48,102 @@ static float rinha_distance_sq(const float query[RINHA_DIM], const rinha_vector_
         diff13 * diff13;
 }
 
-static float rinha_distance_sq_float(const float *lhs, const float *rhs, size_t dim) {
+static float rinha_distance_sq_float_scalar(const float *lhs, const float *rhs, size_t dim) {
     float sum = 0.0f;
     for (size_t i = 0; i < dim; i++) {
         float diff = lhs[i] - rhs[i];
         sum += diff * diff;
     }
     return sum;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+static bool rinha_cpu_has_avx2(void) {
+    static bool initialized = false;
+    static bool has_avx2 = false;
+    if (!initialized) {
+        __builtin_cpu_init();
+        has_avx2 = __builtin_cpu_supports("avx2");
+        initialized = true;
+    }
+    return has_avx2;
+}
+
+static float rinha_reduce_m256(__m256 value) {
+    float lanes[8];
+    _mm256_storeu_ps(lanes, value);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+}
+
+static float rinha_reduce_m128(__m128 value) {
+    float lanes[4];
+    _mm_storeu_ps(lanes, value);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+
+__attribute__((target("avx2")))
+static float rinha_distance_sq_avx2(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+    __m256 query0 = _mm256_loadu_ps(query);
+    __m256i indices0 = _mm256_setr_epi32(
+        (int) vector[0],
+        (int) vector[1],
+        (int) vector[2],
+        (int) vector[3],
+        (int) vector[4],
+        (int) vector[5],
+        (int) vector[6],
+        (int) vector[7]
+    );
+    __m256 values0 = _mm256_i32gather_ps(decode, indices0, 4);
+    __m256 diff0 = _mm256_sub_ps(query0, values0);
+    __m256 sum0 = _mm256_mul_ps(diff0, diff0);
+
+    __m128 query1 = _mm_loadu_ps(query + 8);
+    __m128i indices1 = _mm_setr_epi32(
+        (int) vector[8],
+        (int) vector[9],
+        (int) vector[10],
+        (int) vector[11]
+    );
+    __m128 values1 = _mm_i32gather_ps(decode, indices1, 4);
+    __m128 diff1 = _mm_sub_ps(query1, values1);
+    __m128 sum1 = _mm_mul_ps(diff1, diff1);
+
+    float diff12 = query[12] - decode[vector[12]];
+    float diff13 = query[13] - decode[vector[13]];
+    return rinha_reduce_m256(sum0) + rinha_reduce_m128(sum1) + diff12 * diff12 + diff13 * diff13;
+}
+
+__attribute__((target("avx2")))
+static float rinha_distance_sq_float_avx2(const float *lhs, const float *rhs) {
+    __m256 diff0 = _mm256_sub_ps(_mm256_loadu_ps(lhs), _mm256_loadu_ps(rhs));
+    __m256 sum0 = _mm256_mul_ps(diff0, diff0);
+
+    __m128 diff1 = _mm_sub_ps(_mm_loadu_ps(lhs + 8), _mm_loadu_ps(rhs + 8));
+    __m128 sum1 = _mm_mul_ps(diff1, diff1);
+
+    float diff12 = lhs[12] - rhs[12];
+    float diff13 = lhs[13] - rhs[13];
+    return rinha_reduce_m256(sum0) + rinha_reduce_m128(sum1) + diff12 * diff12 + diff13 * diff13;
+}
+#endif
+
+static float rinha_distance_sq(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (rinha_cpu_has_avx2()) {
+        return rinha_distance_sq_avx2(query, vector, decode);
+    }
+#endif
+    return rinha_distance_sq_scalar(query, vector, decode);
+}
+
+static float rinha_distance_sq_float(const float *lhs, const float *rhs, size_t dim) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (dim == RINHA_DIM && rinha_cpu_has_avx2()) {
+        return rinha_distance_sq_float_avx2(lhs, rhs);
+    }
+#endif
+    return rinha_distance_sq_float_scalar(lhs, rhs, dim);
 }
 
 static void rinha_insert_top5(
