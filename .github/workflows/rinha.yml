@@ -3,7 +3,7 @@ name: CI Test K6
 on:
   push:
     branches:
-      - master
+      - main
 
 jobs:
   ci-k6-test:
