@@ -17,6 +17,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 
 - `src/api.c`
   - atende `GET /ready` e `POST /fraud-score`
+  - usa `generation` em `user_data` para evitar reaproveitamento incorreto de CQEs
   - faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON
 
 - `src/lb.c`
@@ -42,7 +43,8 @@ O projeto nao esta mais na estrategia antiga baseada em LSH como caminho princip
 O estado atual e:
 
 - indice IVF serializado em `index.bin`
-- consulta com ordenacao de listas por lower bound
+- consulta com aquecimento das `nprobe` listas de centroides mais proximos
+- expansao exata so para listas que ainda podem melhorar o `top-5`
 - varredura exata dentro das listas com poda por raio
 - vetores armazenados em 16 bits para reduzir erro de representacao
 

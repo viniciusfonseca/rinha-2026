@@ -29,12 +29,6 @@ typedef enum {
 } api_op_type_t;
 
 typedef struct {
-    api_op_type_t type;
-    int conn_index;
-} api_op_t;
-
-typedef struct {
-    api_op_t op;
     struct sockaddr_storage addr;
     socklen_t addr_len;
 } api_accept_state_t;
@@ -43,13 +37,12 @@ typedef struct {
     int fd;
     bool used;
     bool keep_alive;
+    uint32_t generation;
     size_t read_len;
     size_t write_len;
     size_t write_sent;
     char read_buf[API_READ_BUFFER + 1];
     char write_buf[API_WRITE_BUFFER];
-    api_op_t recv_op;
-    api_op_t send_op;
 } api_conn_t;
 
 typedef enum {
@@ -71,6 +64,19 @@ static volatile sig_atomic_t api_running = 1;
 static void api_on_signal(int signo) {
     (void) signo;
     api_running = 0;
+}
+
+static uint64_t api_pack_user_data(api_op_type_t type, int conn_index, uint32_t generation) {
+    uint64_t packed = (uint64_t) (uint8_t) type;
+    packed |= (uint64_t) (uint16_t) (conn_index + 1) << 8;
+    packed |= (uint64_t) generation << 32;
+    return packed;
+}
+
+static void api_unpack_user_data(uint64_t packed, api_op_type_t *type, int *conn_index, uint32_t *generation) {
+    *type = (api_op_type_t) (packed & 0xffu);
+    *conn_index = (int) (((packed >> 8) & 0xffffu) - 1u);
+    *generation = (uint32_t) (packed >> 32);
 }
 
 static int api_set_nonblocking(int fd) {
@@ -133,43 +139,39 @@ static int api_alloc_conn(api_conn_t *connections, int *free_slots, size_t *free
 
     int i = free_slots[--(*free_count)];
     api_conn_t *conn = &connections[i];
+    uint32_t next_generation = conn->generation + 1u;
     conn->used = true;
     conn->fd = -1;
     conn->keep_alive = false;
+    conn->generation = next_generation == 0u ? 1u : next_generation;
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
-    conn->recv_op.type = API_OP_RECV;
-    conn->recv_op.conn_index = i;
-    conn->send_op.type = API_OP_SEND;
-    conn->send_op.conn_index = i;
     return i;
 }
 
 static int api_submit_accept(struct io_uring *ring, int listen_fd, api_accept_state_t *state) {
-    state->op.type = API_OP_ACCEPT;
-    state->op.conn_index = -1;
     state->addr_len = sizeof(state->addr);
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
         return -1;
     }
     io_uring_prep_accept(sqe, listen_fd, (struct sockaddr *) &state->addr, &state->addr_len, 0);
-    io_uring_sqe_set_data(sqe, &state->op);
+    io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_ACCEPT, -1, 0));
     return io_uring_submit(ring);
 }
 
-static int api_submit_recv(struct io_uring *ring, api_conn_t *conn) {
+static int api_submit_recv(struct io_uring *ring, api_conn_t *conn, int conn_index) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
         return -1;
     }
     io_uring_prep_recv(sqe, conn->fd, conn->read_buf + conn->read_len, API_READ_BUFFER - conn->read_len, 0);
-    io_uring_sqe_set_data(sqe, &conn->recv_op);
+    io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_RECV, conn_index, conn->generation));
     return io_uring_submit(ring);
 }
 
-static int api_submit_send(struct io_uring *ring, api_conn_t *conn) {
+static int api_submit_send(struct io_uring *ring, api_conn_t *conn, int conn_index) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
         return -1;
@@ -181,7 +183,7 @@ static int api_submit_send(struct io_uring *ring, api_conn_t *conn) {
         conn->write_len - conn->write_sent,
         0
     );
-    io_uring_sqe_set_data(sqe, &conn->send_op);
+    io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_SEND, conn_index, conn->generation));
     return io_uring_submit(ring);
 }
 
@@ -459,23 +461,23 @@ int main(void) {
             break;
         }
 
-        api_op_t *op = io_uring_cqe_get_data(cqe);
+        uint64_t user_data = io_uring_cqe_get_data64(cqe);
+        api_op_type_t type;
+        int conn_index;
+        uint32_t generation;
         int res = cqe->res;
         io_uring_cqe_seen(&ring, cqe);
+        api_unpack_user_data(user_data, &type, &conn_index, &generation);
 
-        if (op == NULL) {
-            continue;
-        }
-
-        if (op->type == API_OP_ACCEPT) {
+        if (type == API_OP_ACCEPT) {
             if (res >= 0) {
-                int conn_index = api_alloc_conn(connections, free_slots, &free_count);
-                if (conn_index >= 0) {
-                    api_conn_t *conn = &connections[conn_index];
+                int accepted_conn_index = api_alloc_conn(connections, free_slots, &free_count);
+                if (accepted_conn_index >= 0) {
+                    api_conn_t *conn = &connections[accepted_conn_index];
                     conn->fd = res;
                     api_set_nonblocking(conn->fd);
-                    if (api_submit_recv(&ring, conn) < 0) {
-                        api_close_conn(conn, conn_index, free_slots, &free_count);
+                    if (api_submit_recv(&ring, conn, accepted_conn_index) < 0) {
+                        api_close_conn(conn, accepted_conn_index, free_slots, &free_count);
                     }
                 } else {
                     close(res);
@@ -485,14 +487,17 @@ int main(void) {
             continue;
         }
 
-        api_conn_t *conn = &connections[op->conn_index];
-        if (!conn->used) {
+        if (conn_index < 0 || conn_index >= API_MAX_CONNECTIONS) {
+            continue;
+        }
+        api_conn_t *conn = &connections[conn_index];
+        if (!conn->used || conn->generation != generation) {
             continue;
         }
 
-        if (op->type == API_OP_RECV) {
+        if (type == API_OP_RECV) {
             if (res <= 0) {
-                api_close_conn(conn, op->conn_index, free_slots, &free_count);
+                api_close_conn(conn, conn_index, free_slots, &free_count);
                 continue;
             }
 
@@ -504,9 +509,9 @@ int main(void) {
             if (parse_rc == 0) {
                 if (conn->read_len >= API_READ_BUFFER) {
                     api_prepare_response(conn, "413 Payload Too Large", "text/plain", "payload too large", false);
-                    api_submit_send(&ring, conn);
+                    api_submit_send(&ring, conn, conn_index);
                 } else {
-                    api_submit_recv(&ring, conn);
+                    api_submit_recv(&ring, conn, conn_index);
                 }
                 continue;
             }
@@ -517,31 +522,31 @@ int main(void) {
                 api_handle_business(conn, &request, &index);
             }
 
-            api_submit_send(&ring, conn);
+            api_submit_send(&ring, conn, conn_index);
             continue;
         }
 
-        if (op->type == API_OP_SEND) {
+        if (type == API_OP_SEND) {
             if (res <= 0) {
-                api_close_conn(conn, op->conn_index, free_slots, &free_count);
+                api_close_conn(conn, conn_index, free_slots, &free_count);
                 continue;
             }
 
             conn->write_sent += (size_t) res;
             if (conn->write_sent < conn->write_len) {
-                api_submit_send(&ring, conn);
+                api_submit_send(&ring, conn, conn_index);
                 continue;
             }
 
             if (!conn->keep_alive) {
-                api_close_conn(conn, op->conn_index, free_slots, &free_count);
+                api_close_conn(conn, conn_index, free_slots, &free_count);
                 continue;
             }
 
             conn->read_len = 0;
             conn->write_len = 0;
             conn->write_sent = 0;
-            api_submit_recv(&ring, conn);
+            api_submit_recv(&ring, conn, conn_index);
         }
     }
 

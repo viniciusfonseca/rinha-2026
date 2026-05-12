@@ -16,6 +16,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Servidor HTTP em `io_uring`.
   - Exponibiliza `GET /ready` e `POST /fraud-score`.
   - Mantem `keep-alive` por padrao, a menos que receba `Connection: close`.
+  - Usa `generation` em `user_data` para descartar CQEs antigos quando um slot de conexao e reutilizado.
   - Faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
 
 - [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
@@ -33,7 +34,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
   - Consulta o `index.bin`.
-  - Estrategia atual: ordenar listas IVF por lower bound e fazer varredura exata por lista, com poda por raio.
+  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos e depois expandir apenas para listas que ainda podem bater o pior `top-5`, com poda por raio.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
 
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
@@ -67,12 +68,12 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
-  - `p99 = 4.59ms`
+  - `p99 = 4.61ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 1`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5157.54`
+  - `final_score = 5155.36`
 
 Importante:
 - O `0%` de `failure_rate` vem de arredondamento.

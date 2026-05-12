@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 typedef struct {
-    float lower_bound_sq;
+    float centroid_dist_sq;
     uint32_t list;
 } rinha_list_bound_t;
 
@@ -111,59 +111,105 @@ void rinha_index_close(rinha_index_t *index) {
     memset(index, 0, sizeof(*index));
 }
 
-static void rinha_insert_list_bound(
-    rinha_list_bound_t bounds[RINHA_IVF_NLIST],
-    size_t count,
-    float lower_bound_sq,
-    uint32_t list
-) {
+static void rinha_insert_probe_list(rinha_list_bound_t bounds[RINHA_IVF_NPROBE], size_t count, float centroid_dist_sq, uint32_t list) {
     size_t slot = count;
-    while (slot > 0u && lower_bound_sq < bounds[slot - 1u].lower_bound_sq) {
+    while (slot > 0u && centroid_dist_sq < bounds[slot - 1u].centroid_dist_sq) {
         bounds[slot] = bounds[slot - 1u];
         slot--;
     }
-    bounds[slot].lower_bound_sq = lower_bound_sq;
+    bounds[slot].centroid_dist_sq = centroid_dist_sq;
     bounds[slot].list = list;
 }
 
-static void rinha_plan_lists_exact(
+static size_t rinha_plan_probe_lists(
     const rinha_index_t *index,
     const float query[RINHA_DIM],
-    rinha_list_bound_t bounds[RINHA_IVF_NLIST]
+    float centroid_dist_sq[RINHA_IVF_NLIST],
+    rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE]
 ) {
+    size_t probe_count = 0;
     for (uint32_t list = 0; list < index->nlist; list++) {
         const float *centroid = index->coarse_centroids + (size_t) list * RINHA_DIM;
-        float centroid_dist_sq = rinha_distance_sq_float(query, centroid, RINHA_DIM);
-        float centroid_dist = sqrtf(centroid_dist_sq);
-        float margin = centroid_dist - index->list_radii[list];
-        float lower_bound_sq = margin > 0.0f ? margin * margin : 0.0f;
-        rinha_insert_list_bound(bounds, list, lower_bound_sq, list);
+        float dist_sq = rinha_distance_sq_float(query, centroid, RINHA_DIM);
+        centroid_dist_sq[list] = dist_sq;
+
+        if (probe_count < index->nprobe) {
+            rinha_insert_probe_list(probe_lists, probe_count, dist_sq, list);
+            probe_count++;
+            continue;
+        }
+        if (dist_sq >= probe_lists[probe_count - 1u].centroid_dist_sq) {
+            continue;
+        }
+        rinha_insert_probe_list(probe_lists, probe_count - 1u, dist_sq, list);
+    }
+    return probe_count;
+}
+
+static void rinha_scan_list(
+    const rinha_index_t *index,
+    const float query[RINHA_DIM],
+    uint32_t list,
+    float best_dist[5],
+    uint8_t best_label[5]
+) {
+    uint32_t start = index->list_offsets[list];
+    uint32_t end = index->list_offsets[list + 1u];
+    if (start >= end) {
+        return;
+    }
+
+    for (uint32_t item = start; item < end; item++) {
+        const rinha_vector_scalar_t *vector = index->vectors + (size_t) item * RINHA_DIM;
+        float exact_distance = rinha_distance_sq(query, vector);
+        rinha_insert_top5(best_dist, best_label, exact_distance, index->labels[item]);
     }
 }
 
 int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_DIM]) {
-    rinha_list_bound_t list_bounds[RINHA_IVF_NLIST];
-    rinha_plan_lists_exact(index, query, list_bounds);
+    float centroid_dist_sq[RINHA_IVF_NLIST];
+    rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE];
+    bool selected_lists[RINHA_IVF_NLIST] = {false};
+    size_t probe_count = rinha_plan_probe_lists(index, query, centroid_dist_sq, probe_lists);
 
     float best_dist[5] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
     uint8_t best_label[5] = {0u, 0u, 0u, 0u, 0u};
+    float prune_distance = FLT_MAX;
 
-    for (size_t order = 0; order < index->nlist; order++) {
-        if (best_dist[4] < FLT_MAX && list_bounds[order].lower_bound_sq >= best_dist[4]) {
-            break;
+    for (size_t i = 0; i < probe_count; i++) {
+        uint32_t list = probe_lists[i].list;
+        selected_lists[list] = true;
+
+        if (prune_distance < FLT_MAX) {
+            float max_centroid_dist = prune_distance + index->list_radii[list];
+            if (probe_lists[i].centroid_dist_sq >= max_centroid_dist * max_centroid_dist) {
+                continue;
+            }
         }
 
-        uint32_t list = list_bounds[order].list;
-        uint32_t start = index->list_offsets[list];
-        uint32_t end = index->list_offsets[list + 1u];
-        if (start >= end) {
+        float previous_worst = best_dist[4];
+        rinha_scan_list(index, query, list, best_dist, best_label);
+        if (best_dist[4] < previous_worst) {
+            prune_distance = sqrtf(best_dist[4]);
+        }
+    }
+
+    for (uint32_t list = 0; list < index->nlist; list++) {
+        if (selected_lists[list]) {
             continue;
         }
 
-        for (uint32_t item = start; item < end; item++) {
-            const rinha_vector_scalar_t *vector = index->vectors + (size_t) item * RINHA_DIM;
-            float exact_distance = rinha_distance_sq(query, vector);
-            rinha_insert_top5(best_dist, best_label, exact_distance, index->labels[item]);
+        if (prune_distance < FLT_MAX) {
+            float max_centroid_dist = prune_distance + index->list_radii[list];
+            if (centroid_dist_sq[list] >= max_centroid_dist * max_centroid_dist) {
+                continue;
+            }
+        }
+
+        float previous_worst = best_dist[4];
+        rinha_scan_list(index, query, list, best_dist, best_label);
+        if (best_dist[4] < previous_worst) {
+            prune_distance = sqrtf(best_dist[4]);
         }
     }
 
