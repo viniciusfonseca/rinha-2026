@@ -1,7 +1,7 @@
 #include "vectorize.h"
 
 #include <ctype.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,15 +11,26 @@ typedef struct {
 } rinha_span_t;
 
 typedef struct {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+} rinha_timestamp_t;
+
+typedef struct {
     double amount;
     int installments;
-    char requested_at[32];
+    rinha_timestamp_t requested_at;
 
     double customer_avg_amount;
     int tx_count_24h;
+    rinha_span_t known_merchants;
 
     char merchant_id[32];
-    char merchant_mcc[8];
+    size_t merchant_id_len;
+    uint32_t merchant_mcc_code;
     double merchant_avg_amount;
     bool merchant_known;
 
@@ -28,8 +39,28 @@ typedef struct {
     double km_from_home;
 
     bool has_last_transaction;
-    char last_timestamp[32];
+    rinha_timestamp_t last_timestamp;
     double km_from_current;
+
+    bool amount_set;
+    bool installments_set;
+    bool requested_at_set;
+    bool customer_avg_amount_set;
+    bool tx_count_24h_set;
+    bool known_merchants_set;
+    bool merchant_id_set;
+    bool merchant_mcc_set;
+    bool merchant_avg_amount_set;
+    bool is_online_set;
+    bool card_present_set;
+    bool km_from_home_set;
+    bool last_timestamp_set;
+    bool km_from_current_set;
+    bool transaction_set;
+    bool customer_set;
+    bool merchant_set;
+    bool terminal_set;
+    bool last_transaction_set;
 } rinha_tx_payload_t;
 
 static const struct {
@@ -57,28 +88,61 @@ static const char *rinha_skip_ws(const char *p, const char *end) {
     return p;
 }
 
-static const char *rinha_skip_ws_commas(const char *p, const char *end) {
-    while (p < end && (isspace((unsigned char) *p) || *p == ',')) {
+static bool rinha_span_equals(rinha_span_t span, const char *literal, size_t literal_len) {
+    return (size_t) (span.end - span.start) == literal_len && memcmp(span.start, literal, literal_len) == 0;
+}
+
+static bool rinha_parse_json_string_span(const char **cursor, const char *end, rinha_span_t *out) {
+    const char *p = *cursor;
+    if (p >= end || *p != '"') {
+        return false;
+    }
+
+    const char *start = ++p;
+    bool escaped = false;
+    while (p < end) {
+        char ch = *p;
+        if (escaped) {
+            escaped = false;
+        } else if (ch == '\\') {
+            escaped = true;
+        } else if (ch == '"') {
+            out->start = start;
+            out->end = p;
+            *cursor = p + 1;
+            return true;
+        }
         p++;
     }
-    return p;
+    return false;
 }
 
-static bool rinha_key_equals(const char *key, size_t key_len, const char *literal) {
-    size_t literal_len = strlen(literal);
-    return key_len == literal_len && memcmp(key, literal, key_len) == 0;
+static bool rinha_copy_plain_span(rinha_span_t span, char *out, size_t out_size, size_t *out_len) {
+    size_t len = (size_t) (span.end - span.start);
+    if (len + 1u > out_size) {
+        return false;
+    }
+    if (memchr(span.start, '\\', len) != NULL) {
+        return false;
+    }
+    memcpy(out, span.start, len);
+    out[len] = '\0';
+    if (out_len != NULL) {
+        *out_len = len;
+    }
+    return true;
 }
 
-static bool rinha_extract_delimited_span(const char *value, const char *limit, char open_ch, char close_ch, rinha_span_t *out) {
-    if (value == NULL || value >= limit || *value != open_ch) {
+static bool rinha_skip_delimited(const char **cursor, const char *end, char open_ch, char close_ch) {
+    const char *p = *cursor;
+    if (p >= end || *p != open_ch) {
         return false;
     }
 
     int depth = 0;
     bool in_string = false;
     bool escaped = false;
-    const char *p = value;
-    while (p < limit) {
+    while (p < end) {
         char ch = *p;
         if (in_string) {
             if (escaped) {
@@ -96,8 +160,7 @@ static bool rinha_extract_delimited_span(const char *value, const char *limit, c
             } else if (ch == close_ch) {
                 depth--;
                 if (depth == 0) {
-                    out->start = value;
-                    out->end = p + 1;
+                    *cursor = p + 1;
                     return true;
                 }
             }
@@ -107,176 +170,244 @@ static bool rinha_extract_delimited_span(const char *value, const char *limit, c
     return false;
 }
 
-typedef bool (*rinha_json_member_cb_t)(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx);
-
-static bool rinha_scan_object(rinha_span_t object, rinha_json_member_cb_t cb, void *ctx) {
-    if (object.start == NULL || object.end == NULL || object.end <= object.start + 1 || object.start[0] != '{' || object.end[-1] != '}') {
+static bool rinha_skip_json_value(const char **cursor, const char *end) {
+    const char *p = rinha_skip_ws(*cursor, end);
+    if (p >= end) {
         return false;
     }
 
-    const char *p = object.start + 1;
-    const char *end = object.end - 1;
-
-    while (p < end) {
-        p = rinha_skip_ws_commas(p, end);
-        if (p >= end || *p == '}') {
-            return true;
-        }
-        if (*p != '"') {
+    if (*p == '"') {
+        rinha_span_t ignored;
+        if (!rinha_parse_json_string_span(&p, end, &ignored)) {
             return false;
         }
+        *cursor = p;
+        return true;
+    }
+    if (*p == '{') {
+        if (!rinha_skip_delimited(&p, end, '{', '}')) {
+            return false;
+        }
+        *cursor = p;
+        return true;
+    }
+    if (*p == '[') {
+        if (!rinha_skip_delimited(&p, end, '[', ']')) {
+            return false;
+        }
+        *cursor = p;
+        return true;
+    }
 
-        const char *key_start = ++p;
-        while (p < end) {
-            if (*p == '\\') {
-                p += 2;
-                continue;
-            }
-            if (*p == '"') {
-                break;
-            }
+    while (p < end && !isspace((unsigned char) *p) && *p != ',' && *p != '}' && *p != ']') {
+        p++;
+    }
+    *cursor = p;
+    return true;
+}
+
+static bool rinha_parse_uint_token(const char **cursor, const char *end, unsigned *out) {
+    const char *p = *cursor;
+    if (p >= end || *p < '0' || *p > '9') {
+        return false;
+    }
+
+    unsigned value = 0u;
+    while (p < end && *p >= '0' && *p <= '9') {
+        value = value * 10u + (unsigned) (*p - '0');
+        p++;
+    }
+
+    *out = value;
+    *cursor = p;
+    return true;
+}
+
+static bool rinha_parse_int_token(const char **cursor, const char *end, int *out) {
+    const char *p = *cursor;
+    bool negative = false;
+    if (p < end && (*p == '-' || *p == '+')) {
+        negative = *p == '-';
+        p++;
+    }
+
+    unsigned value = 0u;
+    if (!rinha_parse_uint_token(&p, end, &value)) {
+        return false;
+    }
+
+    *out = negative ? -(int) value : (int) value;
+    *cursor = p;
+    return true;
+}
+
+static bool rinha_parse_double_token(const char **cursor, const char *end, double *out) {
+    const char *p = *cursor;
+    bool negative = false;
+    if (p < end && (*p == '-' || *p == '+')) {
+        negative = *p == '-';
+        p++;
+    }
+
+    const char *number_start = p;
+    uint64_t integer = 0u;
+    bool has_integer = false;
+    while (p < end && *p >= '0' && *p <= '9') {
+        has_integer = true;
+        integer = integer * 10u + (uint64_t) (*p - '0');
+        p++;
+    }
+
+    double value = (double) integer;
+    bool has_fraction = false;
+    if (p < end && *p == '.') {
+        p++;
+        double scale = 0.1;
+        while (p < end && *p >= '0' && *p <= '9') {
+            has_fraction = true;
+            value += (double) (*p - '0') * scale;
+            scale *= 0.1;
             p++;
         }
-        if (p >= end || *p != '"') {
-            return false;
-        }
-        size_t key_len = (size_t) (p - key_start);
-        p++;
+    }
 
-        p = rinha_skip_ws(p, end);
-        if (p >= end || *p != ':') {
+    if (!has_integer && !has_fraction) {
+        return false;
+    }
+
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        char buffer[64];
+        size_t len = 0u;
+        const char *q = *cursor;
+        while (q < end && len + 1u < sizeof(buffer) && !isspace((unsigned char) *q) && *q != ',' && *q != '}' && *q != ']') {
+            buffer[len++] = *q++;
+        }
+        buffer[len] = '\0';
+
+        char *parsed_end = NULL;
+        double fallback = strtod(buffer, &parsed_end);
+        if (parsed_end == buffer || *parsed_end != '\0') {
             return false;
         }
-        p++;
+        *out = fallback;
+        *cursor = q;
+        return true;
+    }
+
+    if (negative) {
+        value = -value;
+    }
+    *out = value;
+    *cursor = p;
+    (void) number_start;
+    return true;
+}
+
+static bool rinha_parse_bool_token(const char **cursor, const char *end, bool *out) {
+    const char *p = *cursor;
+    if ((size_t) (end - p) >= 4u && memcmp(p, "true", 4) == 0) {
+        *out = true;
+        *cursor = p + 4;
+        return true;
+    }
+    if ((size_t) (end - p) >= 5u && memcmp(p, "false", 5) == 0) {
+        *out = false;
+        *cursor = p + 5;
+        return true;
+    }
+    return false;
+}
+
+static bool rinha_parse_timestamp_span(rinha_span_t span, rinha_timestamp_t *timestamp) {
+    if ((size_t) (span.end - span.start) != 20u) {
+        return false;
+    }
+
+    const char *text = span.start;
+    for (size_t i = 0; i < 19u; i++) {
+        if (i == 4u || i == 7u) {
+            if (text[i] != '-') {
+                return false;
+            }
+            continue;
+        }
+        if (i == 10u) {
+            if (text[i] != 'T') {
+                return false;
+            }
+            continue;
+        }
+        if (i == 13u || i == 16u) {
+            if (text[i] != ':') {
+                return false;
+            }
+            continue;
+        }
+        if (!isdigit((unsigned char) text[i])) {
+            return false;
+        }
+    }
+    if (text[19] != 'Z') {
+        return false;
+    }
+
+    timestamp->year = (text[0] - '0') * 1000 + (text[1] - '0') * 100 + (text[2] - '0') * 10 + (text[3] - '0');
+    timestamp->month = (text[5] - '0') * 10 + (text[6] - '0');
+    timestamp->day = (text[8] - '0') * 10 + (text[9] - '0');
+    timestamp->hour = (text[11] - '0') * 10 + (text[12] - '0');
+    timestamp->minute = (text[14] - '0') * 10 + (text[15] - '0');
+    timestamp->second = (text[17] - '0') * 10 + (text[18] - '0');
+    return true;
+}
+
+static bool rinha_parse_timestamp_value(const char **cursor, const char *end, rinha_timestamp_t *timestamp) {
+    rinha_span_t span;
+    if (!rinha_parse_json_string_span(cursor, end, &span)) {
+        return false;
+    }
+    return rinha_parse_timestamp_span(span, timestamp);
+}
+
+static bool rinha_array_contains_string(rinha_span_t array, const char *needle, size_t needle_len) {
+    const char *p = array.start;
+    const char *end = array.end;
+    p = rinha_skip_ws(p, end);
+    if (p >= end || *p != '[') {
+        return false;
+    }
+    p++;
+
+    bool first = true;
+    while (true) {
         p = rinha_skip_ws(p, end);
         if (p >= end) {
             return false;
         }
-
-        const char *value_start = p;
-        const char *value_end = p;
-        if (*p == '"') {
-            p++;
-            while (p < object.end) {
-                if (*p == '\\') {
-                    p += 2;
-                    continue;
-                }
-                if (*p == '"') {
-                    p++;
-                    break;
-                }
-                p++;
-            }
-            if (p > object.end) {
-                return false;
-            }
-            value_end = p;
-        } else if (*p == '{') {
-            rinha_span_t span;
-            if (!rinha_extract_delimited_span(p, object.end, '{', '}', &span)) {
-                return false;
-            }
-            value_end = span.end;
-            p = value_end;
-        } else if (*p == '[') {
-            rinha_span_t span;
-            if (!rinha_extract_delimited_span(p, object.end, '[', ']', &span)) {
-                return false;
-            }
-            value_end = span.end;
-            p = value_end;
-        } else {
-            while (p < end && *p != ',' && *p != '}') {
-                p++;
-            }
-            value_end = p;
-            while (value_end > value_start && isspace((unsigned char) value_end[-1])) {
-                value_end--;
-            }
-        }
-
-        if (!cb(key_start, key_len, value_start, value_end, ctx)) {
+        if (*p == ']') {
             return false;
         }
-
-        p = rinha_skip_ws(p, end);
-        if (p < end && *p == ',') {
-            p++;
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
         }
-    }
+        first = false;
 
-    return true;
-}
-
-static bool rinha_copy_json_string(const char *value_start, const char *value_end, char *out, size_t out_size) {
-    if (value_start == NULL || value_end == NULL || value_end <= value_start + 1 || value_start[0] != '"' || value_end[-1] != '"') {
-        return false;
-    }
-
-    size_t len = (size_t) (value_end - value_start - 2);
-    if (len + 1 > out_size) {
-        return false;
-    }
-
-    memcpy(out, value_start + 1, len);
-    out[len] = '\0';
-    return true;
-}
-
-static bool rinha_array_contains_string(rinha_span_t array, const char *needle) {
-    if (array.start == NULL || array.end == NULL || array.end <= array.start + 1 || array.start[0] != '[' || array.end[-1] != ']') {
-        return false;
-    }
-
-    const size_t needle_len = strlen(needle);
-    const char *p = array.start + 1;
-    const char *end = array.end - 1;
-
-    while (p < end) {
-        p = rinha_skip_ws_commas(p, end);
-        if (p >= end || *p == ']') {
-            break;
-        }
-        if (*p != '"') {
+        rinha_span_t value;
+        if (!rinha_parse_json_string_span(&p, end, &value)) {
             return false;
         }
-
-        const char *value_start = ++p;
-        while (p < end) {
-            if (*p == '\\') {
-                p += 2;
-                continue;
-            }
-            if (*p == '"') {
-                break;
-            }
-            p++;
-        }
-        if (p >= end || *p != '"') {
-            return false;
-        }
-
-        size_t len = (size_t) (p - value_start);
-        if (len == needle_len && memcmp(value_start, needle, len) == 0) {
+        if ((size_t) (value.end - value.start) == needle_len && memcmp(value.start, needle, needle_len) == 0) {
             return true;
         }
-        p++;
     }
-
-    return false;
 }
 
-static float rinha_lookup_mcc_risk(const char *mcc) {
-    if (mcc == NULL) {
-        return 0.5f;
-    }
-
-    uint32_t code = ((uint32_t) (unsigned char) mcc[0] << 24) |
-                    ((uint32_t) (unsigned char) mcc[1] << 16) |
-                    ((uint32_t) (unsigned char) mcc[2] << 8) |
-                    (uint32_t) (unsigned char) mcc[3];
-
+static float rinha_lookup_mcc_risk(uint32_t code) {
     switch (code) {
         case ('5' << 24) | ('4' << 16) | ('1' << 8) | '1':
             return 0.15f;
@@ -303,344 +434,424 @@ static float rinha_lookup_mcc_risk(const char *mcc) {
     }
 }
 
-typedef struct {
-    rinha_span_t transaction;
-    rinha_span_t customer;
-    rinha_span_t merchant;
-    rinha_span_t terminal;
-    rinha_span_t last_transaction;
-    bool last_is_null;
-    bool has_transaction;
-    bool has_customer;
-    bool has_merchant;
-    bool has_terminal;
-    bool has_last_transaction;
-} rinha_root_ctx_t;
+static bool rinha_parse_transaction_object(const char **cursor, const char *end, rinha_tx_payload_t *payload) {
+    const char *p = rinha_skip_ws(*cursor, end);
+    if (p >= end || *p != '{') {
+        return false;
+    }
+    p++;
 
-static bool rinha_parse_root_member(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx) {
-    rinha_root_ctx_t *root = (rinha_root_ctx_t *) ctx;
+    bool first = true;
+    while (true) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end) {
+            return false;
+        }
+        if (*p == '}') {
+            *cursor = p + 1;
+            return payload->amount_set && payload->installments_set && payload->requested_at_set;
+        }
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
+        }
+        first = false;
 
-    if (rinha_key_equals(key, key_len, "transaction")) {
-        if (!rinha_extract_delimited_span(value_start, value_end, '{', '}', &root->transaction)) {
+        rinha_span_t key;
+        if (!rinha_parse_json_string_span(&p, end, &key)) {
             return false;
         }
-        root->has_transaction = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "customer")) {
-        if (!rinha_extract_delimited_span(value_start, value_end, '{', '}', &root->customer)) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end || *p != ':') {
             return false;
         }
-        root->has_customer = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "merchant")) {
-        if (!rinha_extract_delimited_span(value_start, value_end, '{', '}', &root->merchant)) {
+        p = rinha_skip_ws(p + 1, end);
+        if (p >= end) {
             return false;
         }
-        root->has_merchant = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "terminal")) {
-        if (!rinha_extract_delimited_span(value_start, value_end, '{', '}', &root->terminal)) {
-            return false;
-        }
-        root->has_terminal = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "last_transaction")) {
-        root->has_last_transaction = true;
-        if (value_end - value_start == 4 && memcmp(value_start, "null", 4) == 0) {
-            root->last_is_null = true;
-            root->last_transaction.start = NULL;
-            root->last_transaction.end = NULL;
-            return true;
-        }
-        root->last_is_null = false;
-        return rinha_extract_delimited_span(value_start, value_end, '{', '}', &root->last_transaction);
-    }
 
-    return true;
+        if (rinha_span_equals(key, "amount", 6u)) {
+            if (!rinha_parse_double_token(&p, end, &payload->amount)) {
+                return false;
+            }
+            payload->amount_set = true;
+        } else if (rinha_span_equals(key, "installments", 12u)) {
+            if (!rinha_parse_int_token(&p, end, &payload->installments)) {
+                return false;
+            }
+            payload->installments_set = true;
+        } else if (rinha_span_equals(key, "requested_at", 12u)) {
+            if (!rinha_parse_timestamp_value(&p, end, &payload->requested_at)) {
+                return false;
+            }
+            payload->requested_at_set = true;
+        } else if (!rinha_skip_json_value(&p, end)) {
+            return false;
+        }
+    }
 }
 
-typedef struct {
-    rinha_tx_payload_t *payload;
-    bool amount_set;
-    bool installments_set;
-    bool requested_at_set;
-} rinha_transaction_ctx_t;
+static bool rinha_parse_customer_object(const char **cursor, const char *end, rinha_tx_payload_t *payload) {
+    const char *p = rinha_skip_ws(*cursor, end);
+    if (p >= end || *p != '{') {
+        return false;
+    }
+    p++;
 
-static bool rinha_parse_transaction_member(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx) {
-    rinha_transaction_ctx_t *state = (rinha_transaction_ctx_t *) ctx;
-
-    if (rinha_key_equals(key, key_len, "amount")) {
-        char *end = NULL;
-        double parsed = strtod(value_start, &end);
-        if (end == value_start) {
+    bool first = true;
+    while (true) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end) {
             return false;
         }
-        state->payload->amount = parsed;
-        state->amount_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "installments")) {
-        char *end = NULL;
-        long parsed = strtol(value_start, &end, 10);
-        if (end == value_start) {
-            return false;
+        if (*p == '}') {
+            *cursor = p + 1;
+            return payload->customer_avg_amount_set && payload->tx_count_24h_set && payload->known_merchants_set;
         }
-        state->payload->installments = (int) parsed;
-        state->installments_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "requested_at")) {
-        if (!rinha_copy_json_string(value_start, value_end, state->payload->requested_at, sizeof(state->payload->requested_at))) {
-            return false;
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
         }
-        state->requested_at_set = true;
-        return true;
-    }
+        first = false;
 
-    return true;
+        rinha_span_t key;
+        if (!rinha_parse_json_string_span(&p, end, &key)) {
+            return false;
+        }
+        p = rinha_skip_ws(p, end);
+        if (p >= end || *p != ':') {
+            return false;
+        }
+        p = rinha_skip_ws(p + 1, end);
+        if (p >= end) {
+            return false;
+        }
+
+        if (rinha_span_equals(key, "avg_amount", 10u)) {
+            if (!rinha_parse_double_token(&p, end, &payload->customer_avg_amount)) {
+                return false;
+            }
+            payload->customer_avg_amount_set = true;
+        } else if (rinha_span_equals(key, "tx_count_24h", 12u)) {
+            if (!rinha_parse_int_token(&p, end, &payload->tx_count_24h)) {
+                return false;
+            }
+            payload->tx_count_24h_set = true;
+        } else if (rinha_span_equals(key, "known_merchants", 15u)) {
+            const char *array_start = p;
+            if (!rinha_skip_delimited(&p, end, '[', ']')) {
+                return false;
+            }
+            payload->known_merchants.start = array_start;
+            payload->known_merchants.end = p;
+            payload->known_merchants_set = true;
+        } else if (!rinha_skip_json_value(&p, end)) {
+            return false;
+        }
+    }
 }
 
-typedef struct {
-    rinha_tx_payload_t *payload;
-    bool avg_amount_set;
-    bool tx_count_set;
-    bool known_merchants_set;
-} rinha_customer_ctx_t;
+static bool rinha_parse_merchant_object(const char **cursor, const char *end, rinha_tx_payload_t *payload) {
+    const char *p = rinha_skip_ws(*cursor, end);
+    if (p >= end || *p != '{') {
+        return false;
+    }
+    p++;
 
-static bool rinha_parse_customer_member(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx) {
-    rinha_customer_ctx_t *state = (rinha_customer_ctx_t *) ctx;
-
-    if (rinha_key_equals(key, key_len, "avg_amount")) {
-        char *end = NULL;
-        double parsed = strtod(value_start, &end);
-        if (end == value_start) {
+    bool first = true;
+    while (true) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end) {
             return false;
         }
-        state->payload->customer_avg_amount = parsed;
-        state->avg_amount_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "tx_count_24h")) {
-        char *end = NULL;
-        long parsed = strtol(value_start, &end, 10);
-        if (end == value_start) {
+        if (*p == '}') {
+            *cursor = p + 1;
+            return payload->merchant_id_set && payload->merchant_mcc_set && payload->merchant_avg_amount_set;
+        }
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
+        }
+        first = false;
+
+        rinha_span_t key;
+        if (!rinha_parse_json_string_span(&p, end, &key)) {
             return false;
         }
-        state->payload->tx_count_24h = (int) parsed;
-        state->tx_count_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "known_merchants")) {
-        state->payload->merchant_known = rinha_array_contains_string((rinha_span_t) {.start = value_start, .end = value_end}, state->payload->merchant_id);
-        state->known_merchants_set = true;
-        return true;
-    }
+        p = rinha_skip_ws(p, end);
+        if (p >= end || *p != ':') {
+            return false;
+        }
+        p = rinha_skip_ws(p + 1, end);
+        if (p >= end) {
+            return false;
+        }
 
-    return true;
+        if (rinha_span_equals(key, "id", 2u)) {
+            rinha_span_t value;
+            if (!rinha_parse_json_string_span(&p, end, &value) ||
+                !rinha_copy_plain_span(value, payload->merchant_id, sizeof(payload->merchant_id), &payload->merchant_id_len)) {
+                return false;
+            }
+            payload->merchant_id_set = true;
+        } else if (rinha_span_equals(key, "mcc", 3u)) {
+            rinha_span_t value;
+            if (!rinha_parse_json_string_span(&p, end, &value)) {
+                return false;
+            }
+            if ((size_t) (value.end - value.start) != 4u || memchr(value.start, '\\', 4u) != NULL) {
+                return false;
+            }
+            payload->merchant_mcc_code = ((uint32_t) (unsigned char) value.start[0] << 24) |
+                                         ((uint32_t) (unsigned char) value.start[1] << 16) |
+                                         ((uint32_t) (unsigned char) value.start[2] << 8) |
+                                         (uint32_t) (unsigned char) value.start[3];
+            payload->merchant_mcc_set = true;
+        } else if (rinha_span_equals(key, "avg_amount", 10u)) {
+            if (!rinha_parse_double_token(&p, end, &payload->merchant_avg_amount)) {
+                return false;
+            }
+            payload->merchant_avg_amount_set = true;
+        } else if (!rinha_skip_json_value(&p, end)) {
+            return false;
+        }
+    }
 }
 
-typedef struct {
-    rinha_tx_payload_t *payload;
-    bool id_set;
-    bool mcc_set;
-    bool avg_amount_set;
-} rinha_merchant_ctx_t;
+static bool rinha_parse_terminal_object(const char **cursor, const char *end, rinha_tx_payload_t *payload) {
+    const char *p = rinha_skip_ws(*cursor, end);
+    if (p >= end || *p != '{') {
+        return false;
+    }
+    p++;
 
-static bool rinha_parse_merchant_member(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx) {
-    rinha_merchant_ctx_t *state = (rinha_merchant_ctx_t *) ctx;
-
-    if (rinha_key_equals(key, key_len, "id")) {
-        if (!rinha_copy_json_string(value_start, value_end, state->payload->merchant_id, sizeof(state->payload->merchant_id))) {
+    bool first = true;
+    while (true) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end) {
             return false;
         }
-        state->id_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "mcc")) {
-        if (!rinha_copy_json_string(value_start, value_end, state->payload->merchant_mcc, sizeof(state->payload->merchant_mcc))) {
-            return false;
+        if (*p == '}') {
+            *cursor = p + 1;
+            return payload->is_online_set && payload->card_present_set && payload->km_from_home_set;
         }
-        state->mcc_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "avg_amount")) {
-        char *end = NULL;
-        double parsed = strtod(value_start, &end);
-        if (end == value_start) {
-            return false;
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
         }
-        state->payload->merchant_avg_amount = parsed;
-        state->avg_amount_set = true;
-        return true;
-    }
+        first = false;
 
-    return true;
+        rinha_span_t key;
+        if (!rinha_parse_json_string_span(&p, end, &key)) {
+            return false;
+        }
+        p = rinha_skip_ws(p, end);
+        if (p >= end || *p != ':') {
+            return false;
+        }
+        p = rinha_skip_ws(p + 1, end);
+        if (p >= end) {
+            return false;
+        }
+
+        if (rinha_span_equals(key, "is_online", 9u)) {
+            if (!rinha_parse_bool_token(&p, end, &payload->is_online)) {
+                return false;
+            }
+            payload->is_online_set = true;
+        } else if (rinha_span_equals(key, "card_present", 12u)) {
+            if (!rinha_parse_bool_token(&p, end, &payload->card_present)) {
+                return false;
+            }
+            payload->card_present_set = true;
+        } else if (rinha_span_equals(key, "km_from_home", 12u)) {
+            if (!rinha_parse_double_token(&p, end, &payload->km_from_home)) {
+                return false;
+            }
+            payload->km_from_home_set = true;
+        } else if (!rinha_skip_json_value(&p, end)) {
+            return false;
+        }
+    }
 }
 
-typedef struct {
-    rinha_tx_payload_t *payload;
-    bool is_online_set;
-    bool card_present_set;
-    bool km_from_home_set;
-} rinha_terminal_ctx_t;
+static bool rinha_parse_last_transaction_object(const char **cursor, const char *end, rinha_tx_payload_t *payload) {
+    const char *p = rinha_skip_ws(*cursor, end);
+    if (p >= end || *p != '{') {
+        return false;
+    }
+    p++;
 
-static bool rinha_parse_terminal_member(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx) {
-    rinha_terminal_ctx_t *state = (rinha_terminal_ctx_t *) ctx;
-
-    if (rinha_key_equals(key, key_len, "is_online")) {
-        if (value_end - value_start == 4 && memcmp(value_start, "true", 4) == 0) {
-            state->payload->is_online = true;
-        } else if (value_end - value_start == 5 && memcmp(value_start, "false", 5) == 0) {
-            state->payload->is_online = false;
-        } else {
+    bool first = true;
+    while (true) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end) {
             return false;
         }
-        state->is_online_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "card_present")) {
-        if (value_end - value_start == 4 && memcmp(value_start, "true", 4) == 0) {
-            state->payload->card_present = true;
-        } else if (value_end - value_start == 5 && memcmp(value_start, "false", 5) == 0) {
-            state->payload->card_present = false;
-        } else {
-            return false;
+        if (*p == '}') {
+            *cursor = p + 1;
+            return payload->last_timestamp_set && payload->km_from_current_set;
         }
-        state->card_present_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "km_from_home")) {
-        char *end = NULL;
-        double parsed = strtod(value_start, &end);
-        if (end == value_start) {
-            return false;
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
         }
-        state->payload->km_from_home = parsed;
-        state->km_from_home_set = true;
-        return true;
-    }
+        first = false;
 
-    return true;
+        rinha_span_t key;
+        if (!rinha_parse_json_string_span(&p, end, &key)) {
+            return false;
+        }
+        p = rinha_skip_ws(p, end);
+        if (p >= end || *p != ':') {
+            return false;
+        }
+        p = rinha_skip_ws(p + 1, end);
+        if (p >= end) {
+            return false;
+        }
+
+        if (rinha_span_equals(key, "timestamp", 9u)) {
+            if (!rinha_parse_timestamp_value(&p, end, &payload->last_timestamp)) {
+                return false;
+            }
+            payload->last_timestamp_set = true;
+        } else if (rinha_span_equals(key, "km_from_current", 15u)) {
+            if (!rinha_parse_double_token(&p, end, &payload->km_from_current)) {
+                return false;
+            }
+            payload->km_from_current_set = true;
+        } else if (!rinha_skip_json_value(&p, end)) {
+            return false;
+        }
+    }
 }
 
-typedef struct {
-    rinha_tx_payload_t *payload;
-    bool timestamp_set;
-    bool km_from_current_set;
-} rinha_last_ctx_t;
+static bool rinha_parse_payload(const char *json, size_t len, rinha_tx_payload_t *payload) {
+    memset(payload, 0, sizeof(*payload));
 
-static bool rinha_parse_last_member(const char *key, size_t key_len, const char *value_start, const char *value_end, void *ctx) {
-    rinha_last_ctx_t *state = (rinha_last_ctx_t *) ctx;
+    const char *p = rinha_skip_ws(json, json + len);
+    const char *end = json + len;
+    if (p >= end || *p != '{') {
+        return false;
+    }
+    p++;
 
-    if (rinha_key_equals(key, key_len, "timestamp")) {
-        if (!rinha_copy_json_string(value_start, value_end, state->payload->last_timestamp, sizeof(state->payload->last_timestamp))) {
+    bool first = true;
+    while (true) {
+        p = rinha_skip_ws(p, end);
+        if (p >= end) {
             return false;
         }
-        state->timestamp_set = true;
-        return true;
-    }
-    if (rinha_key_equals(key, key_len, "km_from_current")) {
-        char *end = NULL;
-        double parsed = strtod(value_start, &end);
-        if (end == value_start) {
+        if (*p == '}') {
+            break;
+        }
+        if (!first) {
+            if (*p != ',') {
+                return false;
+            }
+            p = rinha_skip_ws(p + 1, end);
+            if (p >= end) {
+                return false;
+            }
+        }
+        first = false;
+
+        rinha_span_t key;
+        if (!rinha_parse_json_string_span(&p, end, &key)) {
             return false;
         }
-        state->payload->km_from_current = parsed;
-        state->km_from_current_set = true;
-        return true;
-    }
+        p = rinha_skip_ws(p, end);
+        if (p >= end || *p != ':') {
+            return false;
+        }
+        p = rinha_skip_ws(p + 1, end);
+        if (p >= end) {
+            return false;
+        }
 
-    return true;
-}
-
-static bool rinha_parse_payload(const char *json, size_t len, rinha_tx_payload_t *out) {
-    memset(out, 0, sizeof(*out));
-
-    rinha_span_t root_span;
-    if (!rinha_extract_delimited_span(json, json + len, '{', '}', &root_span)) {
-        return false;
-    }
-
-    rinha_root_ctx_t root = {0};
-    if (!rinha_scan_object(root_span, rinha_parse_root_member, &root)) {
-        return false;
-    }
-    if (!root.has_transaction || !root.has_customer || !root.has_merchant || !root.has_terminal || !root.has_last_transaction) {
-        return false;
-    }
-
-    rinha_merchant_ctx_t merchant_ctx = {
-        .payload = out,
-    };
-    if (!rinha_scan_object(root.merchant, rinha_parse_merchant_member, &merchant_ctx) ||
-        !merchant_ctx.id_set ||
-        !merchant_ctx.mcc_set ||
-        !merchant_ctx.avg_amount_set) {
-        return false;
-    }
-
-    rinha_transaction_ctx_t transaction_ctx = {
-        .payload = out,
-    };
-    if (!rinha_scan_object(root.transaction, rinha_parse_transaction_member, &transaction_ctx) ||
-        !transaction_ctx.amount_set ||
-        !transaction_ctx.installments_set ||
-        !transaction_ctx.requested_at_set) {
-        return false;
-    }
-
-    rinha_customer_ctx_t customer_ctx = {
-        .payload = out,
-    };
-    if (!rinha_scan_object(root.customer, rinha_parse_customer_member, &customer_ctx) ||
-        !customer_ctx.avg_amount_set ||
-        !customer_ctx.tx_count_set ||
-        !customer_ctx.known_merchants_set) {
-        return false;
-    }
-
-    rinha_terminal_ctx_t terminal_ctx = {
-        .payload = out,
-    };
-    if (!rinha_scan_object(root.terminal, rinha_parse_terminal_member, &terminal_ctx) ||
-        !terminal_ctx.is_online_set ||
-        !terminal_ctx.card_present_set ||
-        !terminal_ctx.km_from_home_set) {
-        return false;
-    }
-
-    if (!root.last_is_null) {
-        out->has_last_transaction = true;
-        rinha_last_ctx_t last_ctx = {
-            .payload = out,
-        };
-        if (!rinha_scan_object(root.last_transaction, rinha_parse_last_member, &last_ctx) ||
-            !last_ctx.timestamp_set ||
-            !last_ctx.km_from_current_set) {
+        if (rinha_span_equals(key, "transaction", 11u)) {
+            if (!rinha_parse_transaction_object(&p, end, payload)) {
+                return false;
+            }
+            payload->transaction_set = true;
+        } else if (rinha_span_equals(key, "customer", 8u)) {
+            if (!rinha_parse_customer_object(&p, end, payload)) {
+                return false;
+            }
+            payload->customer_set = true;
+        } else if (rinha_span_equals(key, "merchant", 8u)) {
+            if (!rinha_parse_merchant_object(&p, end, payload)) {
+                return false;
+            }
+            payload->merchant_set = true;
+        } else if (rinha_span_equals(key, "terminal", 8u)) {
+            if (!rinha_parse_terminal_object(&p, end, payload)) {
+                return false;
+            }
+            payload->terminal_set = true;
+        } else if (rinha_span_equals(key, "last_transaction", 16u)) {
+            if ((size_t) (end - p) >= 4u && memcmp(p, "null", 4) == 0) {
+                p += 4;
+                payload->has_last_transaction = false;
+            } else {
+                payload->has_last_transaction = true;
+                if (!rinha_parse_last_transaction_object(&p, end, payload)) {
+                    return false;
+                }
+            }
+            payload->last_transaction_set = true;
+        } else if (!rinha_skip_json_value(&p, end)) {
             return false;
         }
     }
 
+    if (!payload->transaction_set ||
+        !payload->customer_set ||
+        !payload->merchant_set ||
+        !payload->terminal_set ||
+        !payload->last_transaction_set ||
+        !payload->known_merchants_set ||
+        !payload->merchant_id_set) {
+        return false;
+    }
+
+    payload->merchant_known = rinha_array_contains_string(
+        payload->known_merchants,
+        payload->merchant_id,
+        payload->merchant_id_len
+    );
     return true;
 }
 
 bool rinha_request_to_vector(const char *json, size_t len, float out[RINHA_DIM]) {
     rinha_tx_payload_t payload;
     if (!rinha_parse_payload(json, len, &payload)) {
-        return false;
-    }
-
-    int year = 0;
-    int month = 0;
-    int day = 0;
-    int hour = 0;
-    int minute = 0;
-    int second = 0;
-    if (rinha_parse_utc_timestamp(payload.requested_at, &year, &month, &day, &hour, &minute, &second) != 0) {
         return false;
     }
 
@@ -654,25 +865,29 @@ bool rinha_request_to_vector(const char *json, size_t len, float out[RINHA_DIM])
         out[2] = rinha_clamp01(ratio);
     }
 
-    out[3] = (float) hour / 23.0f;
-    out[4] = (float) rinha_weekday_monday0(year, month, day) / 6.0f;
+    out[3] = (float) payload.requested_at.hour / 23.0f;
+    out[4] = (float) rinha_weekday_monday0(payload.requested_at.year, payload.requested_at.month, payload.requested_at.day) / 6.0f;
 
     if (!payload.has_last_transaction) {
         out[5] = -1.0f;
         out[6] = -1.0f;
     } else {
-        int last_year = 0;
-        int last_month = 0;
-        int last_day = 0;
-        int last_hour = 0;
-        int last_minute = 0;
-        int last_second = 0;
-        if (rinha_parse_utc_timestamp(payload.last_timestamp, &last_year, &last_month, &last_day, &last_hour, &last_minute, &last_second) != 0) {
-            return false;
-        }
-
-        int64_t request_minutes = rinha_epoch_minutes_utc(year, month, day, hour, minute, second);
-        int64_t last_minutes = rinha_epoch_minutes_utc(last_year, last_month, last_day, last_hour, last_minute, last_second);
+        int64_t request_minutes = rinha_epoch_minutes_utc(
+            payload.requested_at.year,
+            payload.requested_at.month,
+            payload.requested_at.day,
+            payload.requested_at.hour,
+            payload.requested_at.minute,
+            payload.requested_at.second
+        );
+        int64_t last_minutes = rinha_epoch_minutes_utc(
+            payload.last_timestamp.year,
+            payload.last_timestamp.month,
+            payload.last_timestamp.day,
+            payload.last_timestamp.hour,
+            payload.last_timestamp.minute,
+            payload.last_timestamp.second
+        );
         double diff_minutes = (double) (request_minutes - last_minutes);
         if (diff_minutes < 0.0) {
             diff_minutes = 0.0;
@@ -687,7 +902,7 @@ bool rinha_request_to_vector(const char *json, size_t len, float out[RINHA_DIM])
     out[9] = payload.is_online ? 1.0f : 0.0f;
     out[10] = payload.card_present ? 1.0f : 0.0f;
     out[11] = payload.merchant_known ? 0.0f : 1.0f;
-    out[12] = rinha_lookup_mcc_risk(payload.merchant_mcc);
+    out[12] = rinha_lookup_mcc_risk(payload.merchant_mcc_code);
     out[13] = rinha_clamp01(payload.merchant_avg_amount / RINHA_NORMALIZATION.max_merchant_avg_amount);
     return true;
 }

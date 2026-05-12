@@ -252,52 +252,57 @@ static int api_parse_http_request(const char *buffer, size_t len, api_request_t 
     request->content_length = 0;
     request->keep_alive = true;
 
-    const char *sp1 = memchr(buffer, ' ', (size_t) (line_end - buffer));
-    if (sp1 == NULL) {
-        return -1;
-    }
-    const char *sp2 = memchr(sp1 + 1, ' ', (size_t) (line_end - (sp1 + 1)));
-    if (sp2 == NULL) {
-        return -1;
-    }
-
-    size_t method_len = (size_t) (sp1 - buffer);
-    size_t path_len = (size_t) (sp2 - (sp1 + 1));
-    if (method_len == 3 && memcmp(buffer, "GET", 3) == 0 && path_len == 6 && memcmp(sp1 + 1, "/ready", 6) == 0) {
+    size_t line_len = (size_t) (line_end - buffer);
+    if (line_len == 19u && memcmp(buffer, "GET /ready HTTP/1.1", 19u) == 0) {
         request->route = API_ROUTE_READY;
-    } else if (method_len == 4 && memcmp(buffer, "POST", 4) == 0 && path_len == 12 && memcmp(sp1 + 1, "/fraud-score", 12) == 0) {
+    } else if (line_len == 26u && memcmp(buffer, "POST /fraud-score HTTP/1.1", 26u) == 0) {
         request->route = API_ROUTE_FRAUD_SCORE;
+    } else {
+        const char *sp1 = memchr(buffer, ' ', line_len);
+        if (sp1 == NULL) {
+            return -1;
+        }
+        const char *sp2 = memchr(sp1 + 1, ' ', (size_t) (line_end - (sp1 + 1)));
+        if (sp2 == NULL) {
+            return -1;
+        }
+        if ((size_t) (line_end - (sp2 + 1)) != 8u || memcmp(sp2 + 1, "HTTP/1.1", 8u) != 0) {
+            return -1;
+        }
     }
 
     const char *cursor = line_end + 2;
+    const char *headers_limit = header_end + 2;
     while (cursor < header_end) {
         const char *next = cursor;
-        while (next < header_end && !(next[0] == '\r' && next[1] == '\n')) {
+        while (next + 1 < headers_limit && !(next[0] == '\r' && next[1] == '\n')) {
             next++;
         }
-        if (next > header_end || next[0] != '\r' || next[1] != '\n') {
+        if (next + 1 >= headers_limit || next[0] != '\r' || next[1] != '\n') {
             return -1;
         }
 
-        const char *colon = memchr(cursor, ':', (size_t) (next - cursor));
-        if (colon == NULL) {
-            return -1;
-        }
-
-        size_t name_len = (size_t) (colon - cursor);
-        const char *value = colon + 1;
-        while (value < next && (*value == ' ' || *value == '\t')) {
-            value++;
-        }
-
-        if (name_len == 14 && api_ascii_ieq(cursor, "Content-Length", 14)) {
+        size_t header_len = (size_t) (next - cursor);
+        const char *value = NULL;
+        if (header_len >= 15u && api_ascii_ieq(cursor, "Content-Length:", 15u)) {
+            value = cursor + 15;
+            while (value < next && (*value == ' ' || *value == '\t')) {
+                value++;
+            }
             size_t content_length = 0;
             while (value < next && *value >= '0' && *value <= '9') {
                 content_length = content_length * 10u + (size_t) (*value - '0');
                 value++;
             }
+            if (value != next) {
+                return -1;
+            }
             request->content_length = content_length;
-        } else if (name_len == 10 && api_ascii_ieq(cursor, "Connection", 10)) {
+        } else if (header_len >= 11u && api_ascii_ieq(cursor, "Connection:", 11u)) {
+            value = cursor + 11;
+            while (value < next && (*value == ' ' || *value == '\t')) {
+                value++;
+            }
             size_t value_len = (size_t) (next - value);
             if (value_len == 5 && api_ascii_ieq(value, "close", 5)) {
                 request->keep_alive = false;
