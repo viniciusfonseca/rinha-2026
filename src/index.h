@@ -21,9 +21,10 @@ typedef struct {
     const float *coarse_centroids;
     const float *pq_codebooks;
     const uint32_t *list_offsets;
+    const float *list_radii;
     const uint8_t *codes;
     const uint8_t *labels;
-    const uint8_t *vectors;
+    const rinha_vector_scalar_t *vectors;
 } rinha_index_t;
 
 bool rinha_index_open(rinha_index_t *index, const char *path);

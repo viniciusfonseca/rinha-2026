@@ -4,50 +4,16 @@
 #include <math.h>
 #include <string.h>
 
-uint8_t rinha_quantize_scalar(double value) {
+rinha_vector_scalar_t rinha_quantize_scalar(double value) {
     if (value < 0.0) {
-        return 255u;
+        return RINHA_VECTOR_QUANT_MISSING;
     }
     float clamped = rinha_clamp01(value);
-    unsigned scaled = (unsigned) lroundf(clamped * 254.0f);
-    if (scaled > 254u) {
-        scaled = 254u;
+    unsigned scaled = (unsigned) lroundf(clamped * (float) RINHA_VECTOR_QUANT_SCALE);
+    if (scaled > RINHA_VECTOR_QUANT_SCALE) {
+        scaled = RINHA_VECTOR_QUANT_SCALE;
     }
-    return (uint8_t) scaled;
-}
-
-static uint64_t rinha_xorshift64(uint64_t *state) {
-    uint64_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    return x;
-}
-
-void rinha_init_lsh_params(rinha_lsh_params_t *params) {
-    memset(params, 0, sizeof(*params));
-
-    uint64_t state = 0x9e3779b97f4a7c15ULL;
-    for (size_t bit = 0; bit < RINHA_SIGNATURE_BITS; bit++) {
-        for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-            uint64_t raw = rinha_xorshift64(&state);
-            uint32_t bucket = (uint32_t) (raw & 0xffffu);
-            params->hyperplanes[bit][dim] = ((float) bucket / 32767.5f) - 1.0f;
-        }
-    }
-
-    for (size_t table = 0; table < RINHA_TABLE_COUNT; table++) {
-        bool used[RINHA_SIGNATURE_BITS] = {false};
-        for (size_t slot = 0; slot < RINHA_BUCKET_BITS; slot++) {
-            size_t candidate = 0;
-            do {
-                candidate = (size_t) (rinha_xorshift64(&state) % RINHA_SIGNATURE_BITS);
-            } while (used[candidate]);
-            used[candidate] = true;
-            params->bit_positions[table][slot] = (uint8_t) candidate;
-        }
-    }
+    return (rinha_vector_scalar_t) scaled;
 }
 
 uint64_t rinha_signature_for_float(const float vector[RINHA_DIM], const rinha_lsh_params_t *params) {
@@ -64,7 +30,7 @@ uint64_t rinha_signature_for_float(const float vector[RINHA_DIM], const rinha_ls
     return signature;
 }
 
-uint64_t rinha_signature_for_quantized(const uint8_t vector[RINHA_DIM], const rinha_lsh_params_t *params) {
+uint64_t rinha_signature_for_quantized(const rinha_vector_scalar_t vector[RINHA_DIM], const rinha_lsh_params_t *params) {
     float decoded[RINHA_DIM];
     for (size_t dim = 0; dim < RINHA_DIM; dim++) {
         decoded[dim] = rinha_dequantize_scalar(vector[dim]);

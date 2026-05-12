@@ -24,6 +24,10 @@
 #define RINHA_IVF_PQ_RERANK 8192u
 #define RINHA_IVF_PQ_TRAIN_SAMPLES 32768u
 #define RINHA_IVF_PQ_KMEANS_ITERS 12u
+#define RINHA_VECTOR_QUANT_SCALE 65534u
+#define RINHA_VECTOR_QUANT_MISSING 65535u
+
+typedef uint16_t rinha_vector_scalar_t;
 
 typedef struct {
     uint8_t bit_positions[RINHA_TABLE_COUNT][RINHA_BUCKET_BITS];
@@ -39,14 +43,13 @@ static inline float rinha_clamp01(double value) {
     }
     return (float) value;
 }
-uint8_t rinha_quantize_scalar(double value);
-static inline float rinha_dequantize_scalar(uint8_t value) {
-    return value == 255u ? -1.0f : (float) value * (1.0f / 254.0f);
+rinha_vector_scalar_t rinha_quantize_scalar(double value);
+static inline float rinha_dequantize_scalar(rinha_vector_scalar_t value) {
+    return value == RINHA_VECTOR_QUANT_MISSING ? -1.0f : (float) value * (1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
 }
 
-void rinha_init_lsh_params(rinha_lsh_params_t *params);
 uint64_t rinha_signature_for_float(const float vector[RINHA_DIM], const rinha_lsh_params_t *params);
-uint64_t rinha_signature_for_quantized(const uint8_t vector[RINHA_DIM], const rinha_lsh_params_t *params);
+uint64_t rinha_signature_for_quantized(const rinha_vector_scalar_t vector[RINHA_DIM], const rinha_lsh_params_t *params);
 uint16_t rinha_table_key(uint64_t signature, const rinha_lsh_params_t *params, size_t table_index);
 
 int rinha_parse_utc_timestamp(
