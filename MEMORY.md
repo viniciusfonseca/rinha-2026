@@ -17,12 +17,14 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Exponibiliza `GET /ready` e `POST /fraud-score`.
   - Mantem `keep-alive` por padrao, a menos que receba `Connection: close`.
   - Usa `generation` em `user_data` para descartar CQEs antigos quando um slot de conexao e reutilizado.
+  - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
   - Faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
 
 - [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
   - Proxy TCP round-robin para clientes e proxy via unix sockets para as APIs.
   - Transparente para HTTP; nao interpreta payload.
   - Usa identificador com `generation` em `user_data` para descartar CQEs antigos e evitar corrupcao em reuse de sessoes.
+  - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
   - Foi ajustado para caber no limite de memoria do LB.
 
 - [src/vectorize.c](/Users/viniciusfonseca/projects/rinha-2026/src/vectorize.c)
@@ -68,12 +70,12 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
-  - `p99 = 4.44ms`
+  - `p99 = 4.52ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 1`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5172.46`
+  - `final_score = 5164.26`
 
 Imagem local validada apos essa rodada:
 - `rinha-2026-local`

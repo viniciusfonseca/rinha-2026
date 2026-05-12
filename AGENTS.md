@@ -18,11 +18,13 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 - `src/api.c`
   - atende `GET /ready` e `POST /fraud-score`
   - usa `generation` em `user_data` para evitar reaproveitamento incorreto de CQEs
+  - drena CQEs em lote e faz flush de SQEs ao final de cada lote
   - faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON
 
 - `src/lb.c`
   - proxy TCP entre cliente e LB, e unix sockets entre LB e APIs
   - mantem conexoes ativas e distribui em round-robin
+  - drena CQEs em lote e faz flush de SQEs ao final de cada lote
 
 - `src/vectorize.c`
   - converte o payload da Rinha em um vetor de 14 dimensoes

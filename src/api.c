@@ -22,6 +22,7 @@
 #define API_MAX_CONNECTIONS 2048
 #define API_READ_BUFFER 16384
 #define API_WRITE_BUFFER 1024
+#define API_CQE_BATCH 64
 #define API_SOCKET_PATH_DEFAULT "/run/rinha/api.sock"
 
 typedef enum {
@@ -60,6 +61,11 @@ typedef struct {
     const char *body;
     size_t total_length;
 } api_request_t;
+
+typedef struct {
+    uint64_t user_data;
+    int res;
+} api_cqe_record_t;
 
 static volatile sig_atomic_t api_running = 1;
 
@@ -164,7 +170,7 @@ static int api_alloc_conn(api_conn_t *connections, int *free_slots, size_t *free
     return i;
 }
 
-static int api_submit_accept(struct io_uring *ring, int listen_fd, api_accept_state_t *state) {
+static int api_queue_accept(struct io_uring *ring, int listen_fd, api_accept_state_t *state) {
     state->addr_len = sizeof(state->addr);
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
@@ -172,20 +178,20 @@ static int api_submit_accept(struct io_uring *ring, int listen_fd, api_accept_st
     }
     io_uring_prep_accept(sqe, listen_fd, (struct sockaddr *) &state->addr, &state->addr_len, 0);
     io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_ACCEPT, -1, 0));
-    return io_uring_submit(ring);
+    return 0;
 }
 
-static int api_submit_recv(struct io_uring *ring, api_conn_t *conn, int conn_index) {
+static int api_queue_recv(struct io_uring *ring, api_conn_t *conn, int conn_index) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
         return -1;
     }
     io_uring_prep_recv(sqe, conn->fd, conn->read_buf + conn->read_len, API_READ_BUFFER - conn->read_len, 0);
     io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_RECV, conn_index, conn->generation));
-    return io_uring_submit(ring);
+    return 0;
 }
 
-static int api_submit_send(struct io_uring *ring, api_conn_t *conn, int conn_index) {
+static int api_queue_send(struct io_uring *ring, api_conn_t *conn, int conn_index) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
         return -1;
@@ -198,7 +204,53 @@ static int api_submit_send(struct io_uring *ring, api_conn_t *conn, int conn_ind
         0
     );
     io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_SEND, conn_index, conn->generation));
+    return 0;
+}
+
+static int api_flush_submissions(struct io_uring *ring) {
     return io_uring_submit(ring);
+}
+
+static ssize_t api_collect_cqes(struct io_uring *ring, api_cqe_record_t *cqes, size_t max_cqes) {
+    if (max_cqes == 0u) {
+        return 0;
+    }
+
+    struct io_uring_cqe *cqe = NULL;
+    int wait_rc = io_uring_wait_cqe(ring, &cqe);
+    if (wait_rc != 0) {
+        if (wait_rc == -EINTR) {
+            return 0;
+        }
+        return -1;
+    }
+
+    size_t count = 0u;
+    cqes[count++] = (api_cqe_record_t) {
+        .user_data = io_uring_cqe_get_data64(cqe),
+        .res = cqe->res,
+    };
+    io_uring_cqe_seen(ring, cqe);
+
+    while (count < max_cqes) {
+        struct io_uring_cqe *batch_cqes[API_CQE_BATCH];
+        unsigned batch = io_uring_peek_batch_cqe(ring, batch_cqes, (unsigned) (max_cqes - count));
+        if (batch == 0u) {
+            break;
+        }
+        for (unsigned i = 0; i < batch && count < max_cqes; i++) {
+            cqes[count++] = (api_cqe_record_t) {
+                .user_data = io_uring_cqe_get_data64(batch_cqes[i]),
+                .res = batch_cqes[i]->res,
+            };
+            io_uring_cqe_seen(ring, batch_cqes[i]);
+        }
+        if (batch < (unsigned) (max_cqes - count + batch)) {
+            break;
+        }
+    }
+
+    return (ssize_t) count;
 }
 
 static bool api_ascii_ieq(const char *a, const char *b, size_t len) {
@@ -466,7 +518,7 @@ int main(void) {
 
     api_accept_state_t accept_state;
     memset(&accept_state, 0, sizeof(accept_state));
-    int accept_rc = api_submit_accept(&ring, listen_fd, &accept_state);
+    int accept_rc = api_queue_accept(&ring, listen_fd, &accept_state);
     if (accept_rc < 0) {
         fprintf(stderr, "falha ao submeter accept inicial no io_uring: rc=%d\n", accept_rc);
         free(connections);
@@ -476,103 +528,147 @@ int main(void) {
         rinha_index_close(&index);
         return 1;
     }
+    if (api_flush_submissions(&ring) < 0) {
+        fprintf(stderr, "falha ao submeter accept inicial no io_uring\n");
+        free(connections);
+        io_uring_queue_exit(&ring);
+        close(listen_fd);
+        unlink(socket_path);
+        rinha_index_close(&index);
+        return 1;
+    }
 
+    api_cqe_record_t cqes[API_CQE_BATCH];
     while (api_running) {
-        struct io_uring_cqe *cqe = NULL;
-        int wait_rc = io_uring_wait_cqe(&ring, &cqe);
-        if (wait_rc != 0) {
-            if (wait_rc == -EINTR) {
-                continue;
-            }
+        ssize_t cqe_count = api_collect_cqes(&ring, cqes, API_CQE_BATCH);
+        if (cqe_count < 0) {
             break;
         }
+        if (cqe_count == 0) {
+            continue;
+        }
 
-        uint64_t user_data = io_uring_cqe_get_data64(cqe);
-        api_op_type_t type;
-        int conn_index;
-        uint32_t generation;
-        int res = cqe->res;
-        io_uring_cqe_seen(&ring, cqe);
-        api_unpack_user_data(user_data, &type, &conn_index, &generation);
+        bool need_submit = false;
+        bool fatal_error = false;
+        for (ssize_t i = 0; i < cqe_count; i++) {
+            uint64_t user_data = cqes[i].user_data;
+            api_op_type_t type;
+            int conn_index;
+            uint32_t generation;
+            int res = cqes[i].res;
+            api_unpack_user_data(user_data, &type, &conn_index, &generation);
 
-        if (type == API_OP_ACCEPT) {
-            if (res >= 0) {
-                int accepted_conn_index = api_alloc_conn(connections, free_slots, &free_count);
-                if (accepted_conn_index >= 0) {
-                    api_conn_t *conn = &connections[accepted_conn_index];
-                    conn->fd = res;
-                    api_set_nonblocking(conn->fd);
-                    if (api_submit_recv(&ring, conn, accepted_conn_index) < 0) {
-                        api_close_conn(conn, accepted_conn_index, free_slots, &free_count);
+            if (type == API_OP_ACCEPT) {
+                if (res >= 0) {
+                    int accepted_conn_index = api_alloc_conn(connections, free_slots, &free_count);
+                    if (accepted_conn_index >= 0) {
+                        api_conn_t *conn = &connections[accepted_conn_index];
+                        conn->fd = res;
+                        api_set_nonblocking(conn->fd);
+                        if (api_queue_recv(&ring, conn, accepted_conn_index) < 0) {
+                            api_close_conn(conn, accepted_conn_index, free_slots, &free_count);
+                            fatal_error = true;
+                        } else {
+                            need_submit = true;
+                        }
+                    } else {
+                        close(res);
                     }
-                } else {
-                    close(res);
                 }
-            }
-            api_submit_accept(&ring, listen_fd, &accept_state);
-            continue;
-        }
-
-        if (conn_index < 0 || conn_index >= API_MAX_CONNECTIONS) {
-            continue;
-        }
-        api_conn_t *conn = &connections[conn_index];
-        if (!conn->used || conn->generation != generation) {
-            continue;
-        }
-
-        if (type == API_OP_RECV) {
-            if (res <= 0) {
-                api_close_conn(conn, conn_index, free_slots, &free_count);
-                continue;
-            }
-
-            conn->read_len += (size_t) res;
-            conn->read_buf[conn->read_len] = '\0';
-
-            api_request_t request;
-            int parse_rc = api_parse_http_request(conn->read_buf, conn->read_len, &request);
-            if (parse_rc == 0) {
-                if (conn->read_len >= API_READ_BUFFER) {
-                    api_prepare_response(conn, "413 Payload Too Large", "text/plain", "payload too large", false);
-                    api_submit_send(&ring, conn, conn_index);
+                if (api_queue_accept(&ring, listen_fd, &accept_state) < 0) {
+                    fatal_error = true;
                 } else {
-                    api_submit_recv(&ring, conn, conn_index);
+                    need_submit = true;
                 }
                 continue;
             }
 
-            if (parse_rc < 0) {
-                api_prepare_response(conn, "400 Bad Request", "text/plain", "bad request", false);
-            } else {
-                api_handle_business(conn, &request, &index);
+            if (conn_index < 0 || conn_index >= API_MAX_CONNECTIONS) {
+                continue;
+            }
+            api_conn_t *conn = &connections[conn_index];
+            if (!conn->used || conn->generation != generation) {
+                continue;
             }
 
-            api_submit_send(&ring, conn, conn_index);
-            continue;
+            if (type == API_OP_RECV) {
+                if (res <= 0) {
+                    api_close_conn(conn, conn_index, free_slots, &free_count);
+                    continue;
+                }
+
+                conn->read_len += (size_t) res;
+                conn->read_buf[conn->read_len] = '\0';
+
+                api_request_t request;
+                int parse_rc = api_parse_http_request(conn->read_buf, conn->read_len, &request);
+                if (parse_rc == 0) {
+                    if (conn->read_len >= API_READ_BUFFER) {
+                        api_prepare_response(conn, "413 Payload Too Large", "text/plain", "payload too large", false);
+                        if (api_queue_send(&ring, conn, conn_index) < 0) {
+                            fatal_error = true;
+                        } else {
+                            need_submit = true;
+                        }
+                    } else if (api_queue_recv(&ring, conn, conn_index) < 0) {
+                        fatal_error = true;
+                    } else {
+                        need_submit = true;
+                    }
+                    continue;
+                }
+
+                if (parse_rc < 0) {
+                    api_prepare_response(conn, "400 Bad Request", "text/plain", "bad request", false);
+                } else {
+                    api_handle_business(conn, &request, &index);
+                }
+
+                if (api_queue_send(&ring, conn, conn_index) < 0) {
+                    fatal_error = true;
+                } else {
+                    need_submit = true;
+                }
+                continue;
+            }
+
+            if (type == API_OP_SEND) {
+                if (res <= 0) {
+                    api_close_conn(conn, conn_index, free_slots, &free_count);
+                    continue;
+                }
+
+                conn->write_sent += (size_t) res;
+                if (conn->write_sent < conn->write_len) {
+                    if (api_queue_send(&ring, conn, conn_index) < 0) {
+                        fatal_error = true;
+                    } else {
+                        need_submit = true;
+                    }
+                    continue;
+                }
+
+                if (!conn->keep_alive) {
+                    api_close_conn(conn, conn_index, free_slots, &free_count);
+                    continue;
+                }
+
+                conn->read_len = 0;
+                conn->write_len = 0;
+                conn->write_sent = 0;
+                if (api_queue_recv(&ring, conn, conn_index) < 0) {
+                    fatal_error = true;
+                } else {
+                    need_submit = true;
+                }
+            }
         }
 
-        if (type == API_OP_SEND) {
-            if (res <= 0) {
-                api_close_conn(conn, conn_index, free_slots, &free_count);
-                continue;
-            }
-
-            conn->write_sent += (size_t) res;
-            if (conn->write_sent < conn->write_len) {
-                api_submit_send(&ring, conn, conn_index);
-                continue;
-            }
-
-            if (!conn->keep_alive) {
-                api_close_conn(conn, conn_index, free_slots, &free_count);
-                continue;
-            }
-
-            conn->read_len = 0;
-            conn->write_len = 0;
-            conn->write_sent = 0;
-            api_submit_recv(&ring, conn, conn_index);
+        if (need_submit && api_flush_submissions(&ring) < 0) {
+            fatal_error = true;
+        }
+        if (fatal_error) {
+            break;
         }
     }
 

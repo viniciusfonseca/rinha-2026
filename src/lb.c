@@ -28,6 +28,7 @@
 #define LB_MAX_SESSIONS 1024
 #define LB_BUFFER_SIZE 4096
 #define LB_MAX_BACKENDS 8
+#define LB_CQE_BATCH 64
 
 typedef enum {
     LB_OP_ACCEPT = 1,
@@ -56,6 +57,11 @@ typedef struct {
     size_t buffer_sent[2];
     char buffer[2][LB_BUFFER_SIZE];
 } lb_session_t;
+
+typedef struct {
+    uint64_t user_data;
+    int res;
+} lb_cqe_record_t;
 
 static volatile sig_atomic_t lb_running = 1;
 
@@ -147,7 +153,7 @@ static int lb_alloc_session(lb_session_t *sessions) {
     return -1;
 }
 
-static int lb_submit_accept(struct io_uring *ring, int listen_fd, lb_accept_state_t *state) {
+static int lb_queue_accept(struct io_uring *ring, int listen_fd, lb_accept_state_t *state) {
     state->addr_len = sizeof(state->addr);
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
@@ -156,20 +162,20 @@ static int lb_submit_accept(struct io_uring *ring, int listen_fd, lb_accept_stat
     }
     io_uring_prep_accept(sqe, listen_fd, (struct sockaddr *) &state->addr, &state->addr_len, 0);
     io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_ACCEPT, -1, -1, 0));
-    return io_uring_submit(ring);
+    return 0;
 }
 
-static int lb_submit_connect(struct io_uring *ring, lb_session_t *session, int session_index, const lb_backend_t *backend) {
+static int lb_queue_connect(struct io_uring *ring, lb_session_t *session, int session_index, const lb_backend_t *backend) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
         return -1;
     }
     io_uring_prep_connect(sqe, session->backend_fd, (const struct sockaddr *) &backend->addr, backend->addr_len);
     io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_CONNECT, session_index, -1, session->generation));
-    return io_uring_submit(ring);
+    return 0;
 }
 
-static int lb_submit_read(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
+static int lb_queue_read(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
     int fd = direction == 0 ? session->client_fd : session->backend_fd;
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
@@ -177,10 +183,10 @@ static int lb_submit_read(struct io_uring *ring, lb_session_t *session, int sess
     }
     io_uring_prep_recv(sqe, fd, session->buffer[direction], LB_BUFFER_SIZE, 0);
     io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_READ, session_index, direction, session->generation));
-    return io_uring_submit(ring);
+    return 0;
 }
 
-static int lb_submit_write(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
+static int lb_queue_write(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
     int fd = direction == 0 ? session->backend_fd : session->client_fd;
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (sqe == NULL) {
@@ -194,7 +200,53 @@ static int lb_submit_write(struct io_uring *ring, lb_session_t *session, int ses
         0
     );
     io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_WRITE, session_index, direction, session->generation));
+    return 0;
+}
+
+static int lb_flush_submissions(struct io_uring *ring) {
     return io_uring_submit(ring);
+}
+
+static ssize_t lb_collect_cqes(struct io_uring *ring, lb_cqe_record_t *cqes, size_t max_cqes) {
+    if (max_cqes == 0u) {
+        return 0;
+    }
+
+    struct io_uring_cqe *cqe = NULL;
+    int wait_rc = io_uring_wait_cqe(ring, &cqe);
+    if (wait_rc != 0) {
+        if (wait_rc == -EINTR) {
+            return 0;
+        }
+        return -1;
+    }
+
+    size_t count = 0u;
+    cqes[count++] = (lb_cqe_record_t) {
+        .user_data = io_uring_cqe_get_data64(cqe),
+        .res = cqe->res,
+    };
+    io_uring_cqe_seen(ring, cqe);
+
+    while (count < max_cqes) {
+        struct io_uring_cqe *batch_cqes[LB_CQE_BATCH];
+        unsigned batch = io_uring_peek_batch_cqe(ring, batch_cqes, (unsigned) (max_cqes - count));
+        if (batch == 0u) {
+            break;
+        }
+        for (unsigned i = 0; i < batch && count < max_cqes; i++) {
+            cqes[count++] = (lb_cqe_record_t) {
+                .user_data = io_uring_cqe_get_data64(batch_cqes[i]),
+                .res = batch_cqes[i]->res,
+            };
+            io_uring_cqe_seen(ring, batch_cqes[i]);
+        }
+        if (batch < (unsigned) (max_cqes - count + batch)) {
+            break;
+        }
+    }
+
+    return (ssize_t) count;
 }
 
 static bool lb_store_unix_backend(lb_backend_t *out, const char *path) {
@@ -306,7 +358,7 @@ int main(void) {
 
     lb_accept_state_t accept_state;
     memset(&accept_state, 0, sizeof(accept_state));
-    int accept_rc = lb_submit_accept(&ring, listen_fd, &accept_state);
+    int accept_rc = lb_queue_accept(&ring, listen_fd, &accept_state);
     if (accept_rc < 0) {
         fprintf(stderr, "falha ao submeter accept inicial no io_uring do balanceador: rc=%d\n", accept_rc);
         free(sessions);
@@ -314,113 +366,149 @@ int main(void) {
         close(listen_fd);
         return 1;
     }
+    if (lb_flush_submissions(&ring) < 0) {
+        fprintf(stderr, "falha ao submeter accept inicial no io_uring do balanceador\n");
+        free(sessions);
+        io_uring_queue_exit(&ring);
+        close(listen_fd);
+        return 1;
+    }
 
     size_t next_backend = 0;
+    lb_cqe_record_t cqes[LB_CQE_BATCH];
     while (lb_running) {
-        struct io_uring_cqe *cqe = NULL;
-        int wait_rc = io_uring_wait_cqe(&ring, &cqe);
-        if (wait_rc != 0) {
-            if (wait_rc == -EINTR) {
-                continue;
-            }
+        ssize_t cqe_count = lb_collect_cqes(&ring, cqes, LB_CQE_BATCH);
+        if (cqe_count < 0) {
             break;
         }
+        if (cqe_count == 0) {
+            continue;
+        }
 
-        uint64_t user_data = io_uring_cqe_get_data64(cqe);
-        lb_op_type_t type;
-        int session_index;
-        int direction;
-        uint32_t generation;
-        int res = cqe->res;
-        io_uring_cqe_seen(&ring, cqe);
+        bool need_submit = false;
+        bool fatal_error = false;
+        for (ssize_t i = 0; i < cqe_count; i++) {
+            uint64_t user_data = cqes[i].user_data;
+            lb_op_type_t type;
+            int session_index;
+            int direction;
+            uint32_t generation;
+            int res = cqes[i].res;
 
-        lb_unpack_user_data(user_data, &type, &session_index, &direction, &generation);
+            lb_unpack_user_data(user_data, &type, &session_index, &direction, &generation);
 
-        if (type == LB_OP_ACCEPT) {
-            if (res >= 0) {
-                int accepted_session_index = lb_alloc_session(sessions);
-                if (accepted_session_index >= 0) {
-                    lb_session_t *session = &sessions[accepted_session_index];
-                    session->client_fd = res;
-                    lb_set_nonblocking(session->client_fd);
+            if (type == LB_OP_ACCEPT) {
+                if (res >= 0) {
+                    int accepted_session_index = lb_alloc_session(sessions);
+                    if (accepted_session_index >= 0) {
+                        lb_session_t *session = &sessions[accepted_session_index];
+                        session->client_fd = res;
+                        lb_set_nonblocking(session->client_fd);
 
-                    const lb_backend_t *backend = &backends[next_backend % backend_count];
-                    next_backend++;
+                        const lb_backend_t *backend = &backends[next_backend % backend_count];
+                        next_backend++;
 
-                    int backend_fd = socket(((struct sockaddr *) &backend->addr)->sa_family, SOCK_STREAM, 0);
-                    if (backend_fd >= 0 && lb_set_nonblocking(backend_fd) == 0) {
-                        session->backend_fd = backend_fd;
-                        if (lb_submit_connect(&ring, session, accepted_session_index, backend) < 0) {
+                        int backend_fd = socket(((struct sockaddr *) &backend->addr)->sa_family, SOCK_STREAM, 0);
+                        if (backend_fd >= 0 && lb_set_nonblocking(backend_fd) == 0) {
+                            session->backend_fd = backend_fd;
+                            if (lb_queue_connect(&ring, session, accepted_session_index, backend) < 0) {
+                                lb_close_session(session);
+                                fatal_error = true;
+                            } else {
+                                need_submit = true;
+                            }
+                        } else {
+                            if (backend_fd >= 0) {
+                                close(backend_fd);
+                            }
                             lb_close_session(session);
                         }
                     } else {
-                        if (backend_fd >= 0) {
-                            close(backend_fd);
-                        }
-                        lb_close_session(session);
+                        close(res);
                     }
+                }
+                if (lb_queue_accept(&ring, listen_fd, &accept_state) < 0) {
+                    fatal_error = true;
                 } else {
-                    close(res);
+                    need_submit = true;
                 }
-            }
-            lb_submit_accept(&ring, listen_fd, &accept_state);
-            continue;
-        }
-
-        if (session_index < 0 || session_index >= LB_MAX_SESSIONS) {
-            continue;
-        }
-        lb_session_t *session = &sessions[session_index];
-        if (!session->used || session->generation != generation) {
-            continue;
-        }
-
-        if (type == LB_OP_CONNECT) {
-            if (res < 0) {
-                lb_close_session(session);
-                continue;
-            }
-            session->connected = true;
-            if (lb_submit_read(&ring, session, session_index, 0) < 0
-                || lb_submit_read(&ring, session, session_index, 1) < 0) {
-                lb_close_session(session);
-            }
-            continue;
-        }
-
-        if (type == LB_OP_READ) {
-            if (res <= 0) {
-                lb_close_session(session);
                 continue;
             }
 
-            session->buffer_len[direction] = (size_t) res;
-            session->buffer_sent[direction] = 0;
-            if (lb_submit_write(&ring, session, session_index, direction) < 0) {
-                lb_close_session(session);
+            if (session_index < 0 || session_index >= LB_MAX_SESSIONS) {
+                continue;
             }
-            continue;
-        }
-
-        if (type == LB_OP_WRITE) {
-            if (res <= 0) {
-                lb_close_session(session);
+            lb_session_t *session = &sessions[session_index];
+            if (!session->used || session->generation != generation) {
                 continue;
             }
 
-            session->buffer_sent[direction] += (size_t) res;
-            if (session->buffer_sent[direction] < session->buffer_len[direction]) {
-                if (lb_submit_write(&ring, session, session_index, direction) < 0) {
+            if (type == LB_OP_CONNECT) {
+                if (res < 0) {
                     lb_close_session(session);
+                    continue;
+                }
+                session->connected = true;
+                if (lb_queue_read(&ring, session, session_index, 0) < 0
+                    || lb_queue_read(&ring, session, session_index, 1) < 0) {
+                    lb_close_session(session);
+                    fatal_error = true;
+                } else {
+                    need_submit = true;
                 }
                 continue;
             }
 
-            session->buffer_len[direction] = 0;
-            session->buffer_sent[direction] = 0;
-            if (lb_submit_read(&ring, session, session_index, direction) < 0) {
-                lb_close_session(session);
+            if (type == LB_OP_READ) {
+                if (res <= 0) {
+                    lb_close_session(session);
+                    continue;
+                }
+
+                session->buffer_len[direction] = (size_t) res;
+                session->buffer_sent[direction] = 0;
+                if (lb_queue_write(&ring, session, session_index, direction) < 0) {
+                    lb_close_session(session);
+                    fatal_error = true;
+                } else {
+                    need_submit = true;
+                }
+                continue;
             }
+
+            if (type == LB_OP_WRITE) {
+                if (res <= 0) {
+                    lb_close_session(session);
+                    continue;
+                }
+
+                session->buffer_sent[direction] += (size_t) res;
+                if (session->buffer_sent[direction] < session->buffer_len[direction]) {
+                    if (lb_queue_write(&ring, session, session_index, direction) < 0) {
+                        lb_close_session(session);
+                        fatal_error = true;
+                    } else {
+                        need_submit = true;
+                    }
+                    continue;
+                }
+
+                session->buffer_len[direction] = 0;
+                session->buffer_sent[direction] = 0;
+                if (lb_queue_read(&ring, session, session_index, direction) < 0) {
+                    lb_close_session(session);
+                    fatal_error = true;
+                } else {
+                    need_submit = true;
+                }
+            }
+        }
+
+        if (need_submit && lb_flush_submissions(&ring) < 0) {
+            fatal_error = true;
+        }
+        if (fatal_error) {
+            break;
         }
     }
 
