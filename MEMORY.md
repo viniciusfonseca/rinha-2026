@@ -39,6 +39,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos e depois expandir apenas para listas que ainda podem bater o pior `top-5`, com poda por raio.
   - O loop quente de distancia usa LUT de dequantizacao para evitar branch e multiplicacao por dimensao no hot path.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
+  - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
 
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
   - Parametros globais do indice e quantizacao.
@@ -70,20 +71,21 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
-  - `p99 = 4.52ms`
+  - `p99 = 4.44ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 1`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5164.26`
+  - `final_score = 5172.06`
 
 Imagem local validada apos essa rodada:
 - `rinha-2026-local`
-- `Size = 35,400,763` bytes em `arm64`
+- `Size = 51,082,063` bytes em `arm64`
 
 Importante:
 - O `0%` de `failure_rate` vem de arredondamento.
 - Ainda existe `1` falso negativo no breakdown.
+- O caminho SIMD em x86 nao altera o comportamento funcional; no Mac arm64 ele cai no fallback scalar.
 
 ## Comandos Uteis
 
