@@ -112,8 +112,9 @@ static uint64_t rinha_xorshift64(uint64_t *state) {
 }
 
 static void rinha_decode_vector(const rinha_vector_scalar_t *vector, float out[RINHA_DIM]) {
+    const float *decode = rinha_dequantize_lut();
     for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-        out[dim] = rinha_dequantize_scalar(vector[dim]);
+        out[dim] = decode[vector[dim]];
     }
 }
 
@@ -174,7 +175,7 @@ static bool rinha_train_kmeans(
         return false;
     }
 
-    for (size_t iter = 0; iter < RINHA_IVF_PQ_KMEANS_ITERS; iter++) {
+    for (size_t iter = 0; iter < RINHA_IVF_KMEANS_ITERS; iter++) {
         memset(sums, 0, (size_t) cluster_count * dim * sizeof(float));
         memset(counts, 0, cluster_count * sizeof(uint32_t));
 
@@ -218,122 +219,16 @@ static void rinha_maybe_add_training_sample(
     uint64_t *rng_state
 ) {
     uint32_t slot = 0u;
-    if (*sample_count < RINHA_IVF_PQ_TRAIN_SAMPLES) {
+    if (*sample_count < RINHA_IVF_TRAIN_SAMPLES) {
         slot = (*sample_count)++;
     } else {
         uint32_t candidate = (uint32_t) (rinha_xorshift64(rng_state) % seen_count);
-        if (candidate >= RINHA_IVF_PQ_TRAIN_SAMPLES) {
+        if (candidate >= RINHA_IVF_TRAIN_SAMPLES) {
             return;
         }
         slot = candidate;
     }
     rinha_decode_vector(vector, samples + (size_t) slot * RINHA_DIM);
-}
-
-static bool rinha_train_ivf_pq(
-    const float *samples,
-    uint32_t sample_count,
-    float *coarse_centroids,
-    float *pq_codebooks
-) {
-    uint64_t rng_state = 0x123456789abcdefULL;
-    uint32_t *sample_assignments = malloc((size_t) sample_count * sizeof(uint32_t));
-    float *residuals = malloc((size_t) sample_count * RINHA_DIM * sizeof(float));
-    float *subspace_points = malloc((size_t) sample_count * RINHA_PQ_SUBDIM * sizeof(float));
-    uint32_t *sub_assignments = malloc((size_t) sample_count * sizeof(uint32_t));
-    if (sample_assignments == NULL || residuals == NULL || subspace_points == NULL || sub_assignments == NULL) {
-        free(sample_assignments);
-        free(residuals);
-        free(subspace_points);
-        free(sub_assignments);
-        return false;
-    }
-
-    if (!rinha_train_kmeans(
-            samples,
-            sample_count,
-            RINHA_DIM,
-            RINHA_IVF_NLIST,
-            coarse_centroids,
-            sample_assignments,
-            &rng_state)) {
-        free(sample_assignments);
-        free(residuals);
-        free(subspace_points);
-        free(sub_assignments);
-        return false;
-    }
-
-    for (uint32_t sample = 0; sample < sample_count; sample++) {
-        const float *point = samples + (size_t) sample * RINHA_DIM;
-        const float *centroid = coarse_centroids + (size_t) sample_assignments[sample] * RINHA_DIM;
-        float *residual = residuals + (size_t) sample * RINHA_DIM;
-        for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-            residual[dim] = point[dim] - centroid[dim];
-        }
-    }
-
-    for (size_t subspace = 0; subspace < RINHA_PQ_M; subspace++) {
-        size_t dim_base = subspace * RINHA_PQ_SUBDIM;
-        for (uint32_t sample = 0; sample < sample_count; sample++) {
-            const float *residual = residuals + (size_t) sample * RINHA_DIM + dim_base;
-            float *subspace_point = subspace_points + (size_t) sample * RINHA_PQ_SUBDIM;
-            for (size_t axis = 0; axis < RINHA_PQ_SUBDIM; axis++) {
-                subspace_point[axis] = residual[axis];
-            }
-        }
-
-        if (!rinha_train_kmeans(
-                subspace_points,
-                sample_count,
-                RINHA_PQ_SUBDIM,
-                RINHA_PQ_KSUB,
-                pq_codebooks + subspace * RINHA_PQ_KSUB * RINHA_PQ_SUBDIM,
-                sub_assignments,
-                &rng_state)) {
-            free(sample_assignments);
-            free(residuals);
-            free(subspace_points);
-            free(sub_assignments);
-            return false;
-        }
-    }
-
-    free(sample_assignments);
-    free(residuals);
-    free(subspace_points);
-    free(sub_assignments);
-    return true;
-}
-
-static void rinha_encode_pq_code(
-    const float point[RINHA_DIM],
-    uint32_t list,
-    const float *coarse_centroids,
-    const float *pq_codebooks,
-    uint8_t out_code[RINHA_PQ_M]
-) {
-    const float *centroid = coarse_centroids + (size_t) list * RINHA_DIM;
-    for (size_t subspace = 0; subspace < RINHA_PQ_M; subspace++) {
-        size_t dim_base = subspace * RINHA_PQ_SUBDIM;
-        float best_dist = FLT_MAX;
-        uint8_t best_code = 0u;
-        for (size_t code = 0; code < RINHA_PQ_KSUB; code++) {
-            const float *codeword = pq_codebooks +
-                ((subspace * RINHA_PQ_KSUB + code) * RINHA_PQ_SUBDIM);
-            float distance = 0.0f;
-            for (size_t axis = 0; axis < RINHA_PQ_SUBDIM; axis++) {
-                float residual = point[dim_base + axis] - centroid[dim_base + axis];
-                float diff = residual - codeword[axis];
-                distance += diff * diff;
-            }
-            if (distance < best_dist) {
-                best_dist = distance;
-                best_code = (uint8_t) code;
-            }
-        }
-        out_code[subspace] = best_code;
-    }
 }
 
 int main(int argc, char **argv) {
@@ -351,7 +246,7 @@ int main(int argc, char **argv) {
     const uint32_t initial_capacity = 3000000u;
     rinha_vector_scalar_t *vectors = malloc((size_t) initial_capacity * RINHA_DIM * sizeof(rinha_vector_scalar_t));
     uint8_t *labels = malloc(initial_capacity);
-    float *samples = malloc((size_t) RINHA_IVF_PQ_TRAIN_SAMPLES * RINHA_DIM * sizeof(float));
+    float *samples = malloc((size_t) RINHA_IVF_TRAIN_SAMPLES * RINHA_DIM * sizeof(float));
     if (vectors == NULL || labels == NULL || samples == NULL) {
         fprintf(stderr, "sem memoria para o dataset\n");
         gzclose(gz);
@@ -449,27 +344,36 @@ int main(int argc, char **argv) {
     fprintf(stderr, "total de vetores: %u\n", count);
 
     float *coarse_centroids = malloc((size_t) RINHA_IVF_NLIST * RINHA_DIM * sizeof(float));
-    float *pq_codebooks = malloc((size_t) RINHA_PQ_M * RINHA_PQ_KSUB * RINHA_PQ_SUBDIM * sizeof(float));
-    if (coarse_centroids == NULL || pq_codebooks == NULL) {
-        fprintf(stderr, "sem memoria para treinar o indice\n");
+    uint32_t *sample_assignments = malloc((size_t) sample_count * sizeof(uint32_t));
+    if (coarse_centroids == NULL || sample_assignments == NULL) {
+        fprintf(stderr, "sem memoria para treinar o indice IVF\n");
         free(vectors);
         free(labels);
         free(samples);
         free(coarse_centroids);
-        free(pq_codebooks);
+        free(sample_assignments);
         return 1;
     }
 
-    if (!rinha_train_ivf_pq(samples, sample_count, coarse_centroids, pq_codebooks)) {
-        fprintf(stderr, "falha ao treinar IVF_PQ\n");
+    uint64_t coarse_rng_state = 0x123456789abcdefULL;
+    if (!rinha_train_kmeans(
+            samples,
+            sample_count,
+            RINHA_DIM,
+            RINHA_IVF_NLIST,
+            coarse_centroids,
+            sample_assignments,
+            &coarse_rng_state)) {
+        fprintf(stderr, "falha ao treinar IVF\n");
         free(vectors);
         free(labels);
         free(samples);
         free(coarse_centroids);
-        free(pq_codebooks);
+        free(sample_assignments);
         return 1;
     }
     free(samples);
+    free(sample_assignments);
 
     uint16_t *list_assignments = malloc((size_t) count * sizeof(uint16_t));
     uint32_t *list_sizes = calloc(RINHA_IVF_NLIST, sizeof(uint32_t));
@@ -479,7 +383,6 @@ int main(int argc, char **argv) {
         free(vectors);
         free(labels);
         free(coarse_centroids);
-        free(pq_codebooks);
         free(list_assignments);
         free(list_sizes);
         free(list_radii);
@@ -510,7 +413,6 @@ int main(int argc, char **argv) {
         free(vectors);
         free(labels);
         free(coarse_centroids);
-        free(pq_codebooks);
         free(list_assignments);
         free(list_sizes);
         free(list_radii);
@@ -525,13 +427,11 @@ int main(int argc, char **argv) {
     uint32_t *cursor = malloc((size_t) RINHA_IVF_NLIST * sizeof(uint32_t));
     rinha_vector_scalar_t *grouped_vectors = malloc((size_t) count * RINHA_DIM * sizeof(rinha_vector_scalar_t));
     uint8_t *grouped_labels = malloc(count);
-    uint8_t *grouped_codes = malloc((size_t) count * RINHA_PQ_M);
-    if (cursor == NULL || grouped_vectors == NULL || grouped_labels == NULL || grouped_codes == NULL) {
-        fprintf(stderr, "sem memoria para serializar IVF_PQ\n");
+    if (cursor == NULL || grouped_vectors == NULL || grouped_labels == NULL) {
+        fprintf(stderr, "sem memoria para serializar IVF\n");
         free(vectors);
         free(labels);
         free(coarse_centroids);
-        free(pq_codebooks);
         free(list_assignments);
         free(list_sizes);
         free(list_radii);
@@ -539,26 +439,16 @@ int main(int argc, char **argv) {
         free(cursor);
         free(grouped_vectors);
         free(grouped_labels);
-        free(grouped_codes);
         return 1;
     }
     memcpy(cursor, list_offsets, (size_t) RINHA_IVF_NLIST * sizeof(uint32_t));
 
     for (uint32_t point = 0; point < count; point++) {
-        const rinha_vector_scalar_t *vector = vectors + (size_t) point * RINHA_DIM;
-        rinha_decode_vector(vector, decoded);
-
         uint16_t list = list_assignments[point];
         uint32_t position = cursor[list]++;
+        const rinha_vector_scalar_t *vector = vectors + (size_t) point * RINHA_DIM;
         memcpy(grouped_vectors + (size_t) position * RINHA_DIM, vector, RINHA_DIM * sizeof(rinha_vector_scalar_t));
         grouped_labels[position] = labels[point];
-        rinha_encode_pq_code(
-            decoded,
-            list,
-            coarse_centroids,
-            pq_codebooks,
-            grouped_codes + (size_t) position * RINHA_PQ_M
-        );
     }
 
     free(vectors);
@@ -571,12 +461,10 @@ int main(int argc, char **argv) {
     if (out == NULL) {
         fprintf(stderr, "falha ao abrir saida %s: %s\n", argv[2], strerror(errno));
         free(coarse_centroids);
-        free(pq_codebooks);
         free(list_offsets);
         free(list_radii);
         free(grouped_vectors);
         free(grouped_labels);
-        free(grouped_codes);
         return 1;
     }
 
@@ -587,38 +475,27 @@ int main(int argc, char **argv) {
     header.dim = RINHA_DIM;
     header.nlist = RINHA_IVF_NLIST;
     header.nprobe = RINHA_IVF_NPROBE;
-    header.pq_m = RINHA_PQ_M;
-    header.pq_subdim = RINHA_PQ_SUBDIM;
-    header.pq_ksub = RINHA_PQ_KSUB;
-    header.rerank_cap = RINHA_IVF_PQ_RERANK;
     header.coarse_centroids_offset = sizeof(header);
-    header.pq_codebooks_offset = header.coarse_centroids_offset +
+    header.list_offsets_offset = header.coarse_centroids_offset +
         (uint64_t) RINHA_IVF_NLIST * RINHA_DIM * sizeof(float);
-    header.list_offsets_offset = header.pq_codebooks_offset +
-        (uint64_t) RINHA_PQ_M * RINHA_PQ_KSUB * RINHA_PQ_SUBDIM * sizeof(float);
     header.list_radii_offset = header.list_offsets_offset +
         (uint64_t) (RINHA_IVF_NLIST + 1u) * sizeof(uint32_t);
-    header.codes_offset = header.list_radii_offset +
+    header.labels_offset = header.list_radii_offset +
         (uint64_t) RINHA_IVF_NLIST * sizeof(float);
-    header.labels_offset = header.codes_offset + (uint64_t) count * RINHA_PQ_M;
     header.vectors_offset = header.labels_offset + count;
 
     fwrite(&header, sizeof(header), 1, out);
     fwrite(coarse_centroids, sizeof(float), (size_t) RINHA_IVF_NLIST * RINHA_DIM, out);
-    fwrite(pq_codebooks, sizeof(float), (size_t) RINHA_PQ_M * RINHA_PQ_KSUB * RINHA_PQ_SUBDIM, out);
     fwrite(list_offsets, sizeof(uint32_t), RINHA_IVF_NLIST + 1u, out);
     fwrite(list_radii, sizeof(float), RINHA_IVF_NLIST, out);
-    fwrite(grouped_codes, RINHA_PQ_M, count, out);
     fwrite(grouped_labels, 1, count, out);
     fwrite(grouped_vectors, sizeof(rinha_vector_scalar_t), (size_t) count * RINHA_DIM, out);
     fclose(out);
 
     free(coarse_centroids);
-    free(pq_codebooks);
     free(list_offsets);
     free(list_radii);
     free(grouped_vectors);
     free(grouped_labels);
-    free(grouped_codes);
     return 0;
 }

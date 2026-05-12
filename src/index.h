@@ -14,15 +14,9 @@ typedef struct {
     uint32_t point_count;
     uint32_t nlist;
     uint32_t nprobe;
-    uint32_t pq_m;
-    uint32_t pq_subdim;
-    uint32_t pq_ksub;
-    uint32_t rerank_cap;
     const float *coarse_centroids;
-    const float *pq_codebooks;
     const uint32_t *list_offsets;
     const float *list_radii;
-    const uint8_t *codes;
     const uint8_t *labels;
     const rinha_vector_scalar_t *vectors;
 } rinha_index_t;

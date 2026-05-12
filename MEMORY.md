@@ -30,11 +30,12 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
   - Baixa o dataset oficial no build da imagem e gera `index.bin`.
-  - Hoje gera estrutura IVF com centroides, offsets por lista, raios por lista, labels, codigos e vetores quantizados.
+  - Hoje gera estrutura IVF enxuta com centroides, offsets por lista, raios por lista, labels e vetores quantizados.
 
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
   - Consulta o `index.bin`.
   - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos e depois expandir apenas para listas que ainda podem bater o pior `top-5`, com poda por raio.
+  - O loop quente de distancia usa LUT de dequantizacao para evitar branch e multiplicacao por dimensao no hot path.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
 
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
@@ -42,21 +43,20 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Estado atual importante:
     - `RINHA_IVF_NLIST = 512`
     - `RINHA_IVF_NPROBE = 16`
-    - `RINHA_PQ_M = 7`
-    - `RINHA_PQ_SUBDIM = 2`
-    - `RINHA_PQ_KSUB = 64`
-    - `RINHA_IVF_PQ_RERANK = 8192`
+    - `RINHA_IVF_TRAIN_SAMPLES = 32768`
+    - `RINHA_IVF_KMEANS_ITERS = 12`
     - vetores armazenados em `uint16_t` via `rinha_vector_scalar_t`
 
 ## Formato do Indice
 
 - Arquivo: [src/index_format.h](/Users/viniciusfonseca/projects/rinha-2026/src/index_format.h)
 - Versao atual:
-  - `RINHA_INDEX_MAGIC = "R26IVF4"`
-  - `RINHA_INDEX_VERSION = 4`
+  - `RINHA_INDEX_MAGIC = "R26IVF5"`
+  - `RINHA_INDEX_VERSION = 5`
 - Mudancas mais recentes:
   - inclusao de `list_radii`
   - armazenamento de vetores em 16 bits
+  - remocao do payload morto de `PQ` do arquivo serializado
 
 Sempre que mudar o formato serializado, atualizar esse header e regenerar `index.bin`.
 
@@ -68,12 +68,16 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
-  - `p99 = 4.61ms`
+  - `p99 = 4.17ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 1`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5155.36`
+  - `final_score = 5199.24`
+
+Imagem local validada apos essa rodada:
+- `rinha-2026-local`
+- `Size = 35,400,763` bytes em `arm64`
 
 Importante:
 - O `0%` de `failure_rate` vem de arredondamento.

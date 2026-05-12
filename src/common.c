@@ -4,6 +4,19 @@
 #include <math.h>
 #include <string.h>
 
+const float *rinha_dequantize_lut(void) {
+    static bool initialized = false;
+    static float table[1u << 16];
+    if (!initialized) {
+        for (size_t i = 0; i < RINHA_VECTOR_QUANT_MISSING; i++) {
+            table[i] = (float) i * (1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
+        }
+        table[RINHA_VECTOR_QUANT_MISSING] = -1.0f;
+        initialized = true;
+    }
+    return table;
+}
+
 rinha_vector_scalar_t rinha_quantize_scalar(double value) {
     if (value < 0.0) {
         return RINHA_VECTOR_QUANT_MISSING;
@@ -31,9 +44,10 @@ uint64_t rinha_signature_for_float(const float vector[RINHA_DIM], const rinha_ls
 }
 
 uint64_t rinha_signature_for_quantized(const rinha_vector_scalar_t vector[RINHA_DIM], const rinha_lsh_params_t *params) {
+    const float *decode = rinha_dequantize_lut();
     float decoded[RINHA_DIM];
     for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-        decoded[dim] = rinha_dequantize_scalar(vector[dim]);
+        decoded[dim] = decode[vector[dim]];
     }
     return rinha_signature_for_float(decoded, params);
 }

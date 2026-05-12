@@ -46,6 +46,7 @@ O estado atual e:
 - consulta com aquecimento das `nprobe` listas de centroides mais proximos
 - expansao exata so para listas que ainda podem melhorar o `top-5`
 - varredura exata dentro das listas com poda por raio
+- arquivo serializado sem payload morto de `PQ`
 - vetores armazenados em 16 bits para reduzir erro de representacao
 
 Se encontrar documentacao antiga mencionando LSH como estrategia principal, trate como desatualizada e confirme no codigo atual.

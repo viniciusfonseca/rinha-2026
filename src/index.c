@@ -13,13 +13,35 @@ typedef struct {
     uint32_t list;
 } rinha_list_bound_t;
 
-static float rinha_distance_sq(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector) {
-    float sum = 0.0f;
-    for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-        float diff = query[dim] - rinha_dequantize_scalar(vector[dim]);
-        sum += diff * diff;
-    }
-    return sum;
+static float rinha_distance_sq(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+    float diff0 = query[0] - decode[vector[0]];
+    float diff1 = query[1] - decode[vector[1]];
+    float diff2 = query[2] - decode[vector[2]];
+    float diff3 = query[3] - decode[vector[3]];
+    float diff4 = query[4] - decode[vector[4]];
+    float diff5 = query[5] - decode[vector[5]];
+    float diff6 = query[6] - decode[vector[6]];
+    float diff7 = query[7] - decode[vector[7]];
+    float diff8 = query[8] - decode[vector[8]];
+    float diff9 = query[9] - decode[vector[9]];
+    float diff10 = query[10] - decode[vector[10]];
+    float diff11 = query[11] - decode[vector[11]];
+    float diff12 = query[12] - decode[vector[12]];
+    float diff13 = query[13] - decode[vector[13]];
+    return diff0 * diff0 +
+        diff1 * diff1 +
+        diff2 * diff2 +
+        diff3 * diff3 +
+        diff4 * diff4 +
+        diff5 * diff5 +
+        diff6 * diff6 +
+        diff7 * diff7 +
+        diff8 * diff8 +
+        diff9 * diff9 +
+        diff10 * diff10 +
+        diff11 * diff11 +
+        diff12 * diff12 +
+        diff13 * diff13;
 }
 
 static float rinha_distance_sq_float(const float *lhs, const float *rhs, size_t dim) {
@@ -76,11 +98,7 @@ bool rinha_index_open(rinha_index_t *index, const char *path) {
         header->version != RINHA_INDEX_VERSION ||
         header->dim != RINHA_DIM ||
         header->nlist != RINHA_IVF_NLIST ||
-        header->nprobe != RINHA_IVF_NPROBE ||
-        header->pq_m != RINHA_PQ_M ||
-        header->pq_subdim != RINHA_PQ_SUBDIM ||
-        header->pq_ksub != RINHA_PQ_KSUB ||
-        header->rerank_cap != RINHA_IVF_PQ_RERANK) {
+        header->nprobe != RINHA_IVF_NPROBE) {
         munmap(mapping, (size_t) st.st_size);
         return false;
     }
@@ -90,15 +108,9 @@ bool rinha_index_open(rinha_index_t *index, const char *path) {
     index->point_count = header->point_count;
     index->nlist = header->nlist;
     index->nprobe = header->nprobe;
-    index->pq_m = header->pq_m;
-    index->pq_subdim = header->pq_subdim;
-    index->pq_ksub = header->pq_ksub;
-    index->rerank_cap = header->rerank_cap;
     index->coarse_centroids = (const float *) ((const unsigned char *) mapping + header->coarse_centroids_offset);
-    index->pq_codebooks = (const float *) ((const unsigned char *) mapping + header->pq_codebooks_offset);
     index->list_offsets = (const uint32_t *) ((const unsigned char *) mapping + header->list_offsets_offset);
     index->list_radii = (const float *) ((const unsigned char *) mapping + header->list_radii_offset);
-    index->codes = (const uint8_t *) ((const unsigned char *) mapping + header->codes_offset);
     index->labels = (const uint8_t *) ((const unsigned char *) mapping + header->labels_offset);
     index->vectors = (const rinha_vector_scalar_t *) ((const unsigned char *) mapping + header->vectors_offset);
     return true;
@@ -149,6 +161,7 @@ static size_t rinha_plan_probe_lists(
 static void rinha_scan_list(
     const rinha_index_t *index,
     const float query[RINHA_DIM],
+    const float *decode,
     uint32_t list,
     float best_dist[5],
     uint8_t best_label[5]
@@ -161,12 +174,13 @@ static void rinha_scan_list(
 
     for (uint32_t item = start; item < end; item++) {
         const rinha_vector_scalar_t *vector = index->vectors + (size_t) item * RINHA_DIM;
-        float exact_distance = rinha_distance_sq(query, vector);
+        float exact_distance = rinha_distance_sq(query, vector, decode);
         rinha_insert_top5(best_dist, best_label, exact_distance, index->labels[item]);
     }
 }
 
 int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_DIM]) {
+    const float *decode = rinha_dequantize_lut();
     float centroid_dist_sq[RINHA_IVF_NLIST];
     rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE];
     bool selected_lists[RINHA_IVF_NLIST] = {false};
@@ -188,7 +202,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         }
 
         float previous_worst = best_dist[4];
-        rinha_scan_list(index, query, list, best_dist, best_label);
+        rinha_scan_list(index, query, decode, list, best_dist, best_label);
         if (best_dist[4] < previous_worst) {
             prune_distance = sqrtf(best_dist[4]);
         }
@@ -207,7 +221,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         }
 
         float previous_worst = best_dist[4];
-        rinha_scan_list(index, query, list, best_dist, best_label);
+        rinha_scan_list(index, query, decode, list, best_dist, best_label);
         if (best_dist[4] < previous_worst) {
             prune_distance = sqrtf(best_dist[4]);
         }

@@ -18,12 +18,8 @@
 
 #define RINHA_IVF_NLIST 512u
 #define RINHA_IVF_NPROBE 16u
-#define RINHA_PQ_M 7u
-#define RINHA_PQ_SUBDIM 2u
-#define RINHA_PQ_KSUB 64u
-#define RINHA_IVF_PQ_RERANK 8192u
-#define RINHA_IVF_PQ_TRAIN_SAMPLES 32768u
-#define RINHA_IVF_PQ_KMEANS_ITERS 12u
+#define RINHA_IVF_TRAIN_SAMPLES 32768u
+#define RINHA_IVF_KMEANS_ITERS 12u
 #define RINHA_VECTOR_QUANT_SCALE 65534u
 #define RINHA_VECTOR_QUANT_MISSING 65535u
 
@@ -47,6 +43,7 @@ rinha_vector_scalar_t rinha_quantize_scalar(double value);
 static inline float rinha_dequantize_scalar(rinha_vector_scalar_t value) {
     return value == RINHA_VECTOR_QUANT_MISSING ? -1.0f : (float) value * (1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
 }
+const float *rinha_dequantize_lut(void);
 
 uint64_t rinha_signature_for_float(const float vector[RINHA_DIM], const rinha_lsh_params_t *params);
 uint64_t rinha_signature_for_quantized(const rinha_vector_scalar_t vector[RINHA_DIM], const rinha_lsh_params_t *params);
