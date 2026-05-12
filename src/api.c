@@ -6,6 +6,7 @@
 #include <liburing.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,14 +14,15 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
-#define API_PORT 9999
 #define API_BACKLOG 1024
 #define API_QUEUE_DEPTH 2048
 #define API_MAX_CONNECTIONS 2048
 #define API_READ_BUFFER 16384
 #define API_WRITE_BUFFER 1024
+#define API_SOCKET_PATH_DEFAULT "/run/rinha/api.sock"
 
 typedef enum {
     API_OP_ACCEPT = 1,
@@ -87,26 +89,38 @@ static int api_set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static int api_open_listener(uint16_t port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+static int api_open_listener(const char *socket_path) {
+    if (socket_path == NULL || socket_path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t path_len = strlen(socket_path);
+    if (path_len >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
     }
 
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (api_set_nonblocking(fd) != 0) {
         close(fd);
         return -1;
     }
 
-    struct sockaddr_in addr;
+    struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
 
-    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0 || listen(fd, API_BACKLOG) != 0) {
+    unlink(socket_path);
+
+    socklen_t addr_len = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + path_len + 1u);
+    if (bind(fd, (struct sockaddr *) &addr, addr_len) != 0 || listen(fd, API_BACKLOG) != 0) {
+        unlink(socket_path);
         close(fd);
         return -1;
     }
@@ -403,6 +417,10 @@ int main(void) {
     if (index_path == NULL) {
         index_path = "/opt/rinha/index.bin";
     }
+    const char *socket_path = getenv("API_SOCKET_PATH");
+    if (socket_path == NULL) {
+        socket_path = API_SOCKET_PATH_DEFAULT;
+    }
 
     signal(SIGINT, api_on_signal);
     signal(SIGTERM, api_on_signal);
@@ -413,9 +431,9 @@ int main(void) {
         return 1;
     }
 
-    int listen_fd = api_open_listener(API_PORT);
+    int listen_fd = api_open_listener(socket_path);
     if (listen_fd < 0) {
-        fprintf(stderr, "falha ao abrir porta %d\n", API_PORT);
+        fprintf(stderr, "falha ao abrir socket unix %s\n", socket_path);
         rinha_index_close(&index);
         return 1;
     }
@@ -424,6 +442,7 @@ int main(void) {
     if (io_uring_queue_init(API_QUEUE_DEPTH, &ring, 0) != 0) {
         fprintf(stderr, "falha ao inicializar io_uring\n");
         close(listen_fd);
+        unlink(socket_path);
         rinha_index_close(&index);
         return 1;
     }
@@ -435,6 +454,7 @@ int main(void) {
         free(free_slots);
         io_uring_queue_exit(&ring);
         close(listen_fd);
+        unlink(socket_path);
         rinha_index_close(&index);
         return 1;
     }
@@ -452,6 +472,7 @@ int main(void) {
         free(connections);
         io_uring_queue_exit(&ring);
         close(listen_fd);
+        unlink(socket_path);
         rinha_index_close(&index);
         return 1;
     }
@@ -564,6 +585,7 @@ int main(void) {
     free(free_slots);
     io_uring_queue_exit(&ring);
     close(listen_fd);
+    unlink(socket_path);
     rinha_index_close(&index);
     return 0;
 }

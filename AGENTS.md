@@ -9,7 +9,7 @@ Leia este arquivo primeiro. Para estado operacional mais recente, resultados de 
 Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 
 - API HTTP baseada em `io_uring`
-- load balancer TCP round-robin baseado em `io_uring`
+- load balancer TCP round-robin para clientes e unix sockets para as APIs, baseado em `io_uring`
 - preprocess offline que gera `index.bin`
 - imagem final `FROM scratch`
 
@@ -21,7 +21,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON
 
 - `src/lb.c`
-  - proxy TCP entre cliente e APIs
+  - proxy TCP entre cliente e LB, e unix sockets entre LB e APIs
   - mantem conexoes ativas e distribui em round-robin
 
 - `src/vectorize.c`
@@ -57,15 +57,12 @@ Se encontrar documentacao antiga mencionando LSH como estrategia principal, trat
   - baseline oficial
   - `linux/amd64`
   - deve continuar sendo o caminho padrao
+  - monta um volume compartilhado em `/run/rinha` para os sockets internos
 
 - `docker-compose.macos.yml`
   - excecao para desenvolvimento local em Mac
   - usa `linux/arm64/v8`
   - mantem os mesmos limites do compose oficial, mudando apenas a plataforma
-
-- `docker-compose.macos-rinha.yml`
-  - override alternativo para Mac preservando o desenho de recursos oficial
-  - atualmente equivalente em pratica ao `docker-compose.macos.yml`
 
 Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linux/amd64`.
 
@@ -104,6 +101,7 @@ Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linu
 ## Armadilhas Conhecidas
 
 - `io_uring` com Docker Desktop no Mac em `linux/amd64` pode falhar via emulacao
+- a comunicacao interna LB -> API usa unix sockets em `/run/rinha`
 - o LB ja estourou memoria quando buffers e sessoes estavam grandes demais
 - o LB ja teve bug de reuse de sessao com CQEs antigos; preserve a logica de `generation`
 - o build da imagem depende de rede para baixar `references.json.gz`

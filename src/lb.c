@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +15,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define LB_PORT 9999
@@ -195,14 +197,50 @@ static int lb_submit_write(struct io_uring *ring, lb_session_t *session, int ses
     return io_uring_submit(ring);
 }
 
+static bool lb_store_unix_backend(lb_backend_t *out, const char *path) {
+    size_t path_len = strlen(path);
+    if (path_len == 0u || path_len >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
+        return false;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, path, path_len + 1u);
+
+    memset(&out->addr, 0, sizeof(out->addr));
+    memcpy(&out->addr, &addr, sizeof(addr));
+    out->addr_len = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + path_len + 1u);
+    return true;
+}
+
 static size_t lb_parse_backends(const char *env, lb_backend_t *out) {
-    const char *source = env == NULL ? "api1:9999,api2:9999" : env;
+    const char *source = env == NULL ? "unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock" : env;
     char text[256];
     snprintf(text, sizeof(text), "%s", source);
 
     size_t count = 0;
     char *saveptr = NULL;
     for (char *token = strtok_r(text, ",", &saveptr); token != NULL && count < LB_MAX_BACKENDS; token = strtok_r(NULL, ",", &saveptr)) {
+        while (*token == ' ' || *token == '\t') {
+            token++;
+        }
+
+        char *tail = token + strlen(token);
+        while (tail > token && (tail[-1] == ' ' || tail[-1] == '\t')) {
+            *--tail = '\0';
+        }
+
+        if (strncmp(token, "unix:", 5) == 0) {
+            const char *path = token + 5;
+            if (!lb_store_unix_backend(&out[count], path)) {
+                fprintf(stderr, "falha ao configurar backend unix %s\n", path);
+                continue;
+            }
+            count++;
+            continue;
+        }
+
         char *colon = strrchr(token, ':');
         if (colon == NULL) {
             continue;

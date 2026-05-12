@@ -5,10 +5,10 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 ## Resumo Rapido
 
 - Projeto: backend da Rinha 2026 em C.
-- Stack: API HTTP com `io_uring`, load balancer TCP round-robin com `io_uring`, preprocess offline para gerar `index.bin`.
+- Stack: API HTTP com `io_uring`, load balancer TCP round-robin para clientes e unix sockets para as APIs, preprocess offline para gerar `index.bin`.
 - Imagem final: `FROM scratch`, contendo apenas `fraud_api`, `fraud_lb` e `/opt/rinha/index.bin`.
 - Ambiente padrao de submissao: `linux/amd64` com `1 CPU` e `350 MB` no total.
-- Ambiente de excecao para desenvolvimento local em Mac: overrides em `docker-compose.macos.yml` e `docker-compose.macos-rinha.yml`, ambos apenas para trocar a plataforma para `linux/arm64/v8`.
+- Ambiente de excecao para desenvolvimento local em Mac: override em `docker-compose.macos.yml`, apenas para trocar a plataforma para `linux/arm64/v8`.
 
 ## Arquitetura Atual
 
@@ -20,7 +20,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
 
 - [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
-  - Proxy TCP round-robin.
+  - Proxy TCP round-robin para clientes e proxy via unix sockets para as APIs.
   - Transparente para HTTP; nao interpreta payload.
   - Usa identificador com `generation` em `user_data` para descartar CQEs antigos e evitar corrupcao em reuse de sessoes.
   - Foi ajustado para caber no limite de memoria do LB.
@@ -68,12 +68,12 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
-  - `p99 = 4.17ms`
+  - `p99 = 4.44ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 1`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5199.24`
+  - `final_score = 5172.46`
 
 Imagem local validada apos essa rodada:
 - `rinha-2026-local`
@@ -113,15 +113,12 @@ Importante:
   - Base oficial.
   - `platform: linux/amd64`.
   - Orcamento total da Rinha dividido entre `lb`, `api1` e `api2`.
+  - `lb` e `api1/api2` compartilham um volume com sockets unix em `/run/rinha`.
 
 - [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
   - Excecao para desenvolvimento local em Mac.
   - Usa `linux/arm64/v8`.
   - Mantem o mesmo desenho de recursos do compose oficial.
-
-- [docker-compose.macos-rinha.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos-rinha.yml)
-  - Override alternativo para Mac com o mesmo objetivo.
-  - Hoje e funcionalmente equivalente ao `docker-compose.macos.yml`.
 
 ## Armadilhas Ja Descobertas
 
@@ -134,6 +131,10 @@ Importante:
 
 - O `LB` ja teve bug de reuse de sessao com CQEs antigos.
   - Preserve a logica de `generation` em `user_data`.
+
+- A comunicacao interna `LB -> API` agora usa unix sockets.
+  - Os caminhos padrao sao `/run/rinha/api1.sock` e `/run/rinha/api2.sock`.
+  - O compose monta um volume compartilhado em `/run/rinha`.
 
 - A API ja caiu em timeouts quando a busca degenerava para custo alto por request.
   - Hoje a busca esta mais previsivel com listas ordenadas por lower bound e poda por raio.
@@ -163,7 +164,6 @@ Importante:
 - [Dockerfile](/Users/viniciusfonseca/projects/rinha-2026/Dockerfile)
 - [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml)
 - [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
-- [docker-compose.macos-rinha.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos-rinha.yml)
 - [src/api.c](/Users/viniciusfonseca/projects/rinha-2026/src/api.c)
 - [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
 - [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
