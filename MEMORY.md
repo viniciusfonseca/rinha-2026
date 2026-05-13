@@ -36,7 +36,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
   - Consulta o `index.bin`.
-  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos e depois expandir as listas restantes em ordem de `lower bound`, parando cedo quando o `top-5` ja esta matematicamente fechado.
+  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos, podar listas restantes por raio sem `sqrt`, ordenar so as sobreviventes por `lower bound` e parar cedo quando o `top-5` ja esta matematicamente fechado.
   - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, para reduzir custo de CPU/cache no runtime.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.

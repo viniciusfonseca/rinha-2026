@@ -3,6 +3,7 @@
 #include <math.h>
 #include <float.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -245,18 +246,12 @@ static void rinha_insert_probe_list(rinha_list_bound_t bounds[RINHA_IVF_NPROBE],
 }
 
 static void rinha_insert_candidate_list(
-    rinha_list_candidate_t *candidates,
-    size_t count,
+    rinha_list_candidate_t *candidate,
     float lower_bound_sq,
     uint32_t list
 ) {
-    size_t slot = count;
-    while (slot > 0u && lower_bound_sq < candidates[slot - 1u].lower_bound_sq) {
-        candidates[slot] = candidates[slot - 1u];
-        slot--;
-    }
-    candidates[slot].lower_bound_sq = lower_bound_sq;
-    candidates[slot].list = list;
+    candidate->lower_bound_sq = lower_bound_sq;
+    candidate->list = list;
 }
 
 static float rinha_list_lower_bound_sq(float centroid_dist_sq, float radius) {
@@ -266,6 +261,18 @@ static float rinha_list_lower_bound_sq(float centroid_dist_sq, float radius) {
     }
     float lower_bound = centroid_dist - radius;
     return lower_bound * lower_bound;
+}
+
+static int rinha_compare_candidate_lists(const void *lhs_ptr, const void *rhs_ptr) {
+    const rinha_list_candidate_t *lhs = (const rinha_list_candidate_t *) lhs_ptr;
+    const rinha_list_candidate_t *rhs = (const rinha_list_candidate_t *) rhs_ptr;
+    if (lhs->lower_bound_sq < rhs->lower_bound_sq) {
+        return -1;
+    }
+    if (lhs->lower_bound_sq > rhs->lower_bound_sq) {
+        return 1;
+    }
+    return 0;
 }
 
 static size_t rinha_plan_probe_lists(
@@ -336,15 +343,26 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     }
 
     size_t candidate_count = 0u;
+    float prune_distance = best_dist[4] < FLT_MAX ? sqrtf(best_dist[4]) : FLT_MAX;
     for (uint32_t list = 0; list < index->nlist; list++) {
         if (selected_lists[list]) {
             continue;
+        }
+        if (prune_distance < FLT_MAX) {
+            float max_centroid_dist = prune_distance + index->list_radii[list];
+            if (centroid_dist_sq[list] >= max_centroid_dist * max_centroid_dist) {
+                continue;
+            }
         }
         float lower_bound_sq = rinha_list_lower_bound_sq(centroid_dist_sq[list], index->list_radii[list]);
         if (lower_bound_sq >= best_dist[4]) {
             continue;
         }
-        rinha_insert_candidate_list(candidate_lists, candidate_count++, lower_bound_sq, list);
+        rinha_insert_candidate_list(&candidate_lists[candidate_count++], lower_bound_sq, list);
+    }
+
+    if (candidate_count > 1u) {
+        qsort(candidate_lists, candidate_count, sizeof(candidate_lists[0]), rinha_compare_candidate_lists);
     }
 
     for (size_t i = 0; i < candidate_count; i++) {
