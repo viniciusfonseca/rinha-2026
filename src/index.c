@@ -27,6 +27,14 @@ typedef struct {
 } rinha_list_candidate_t;
 
 typedef struct {
+    uint32_t start;
+    uint32_t end;
+    uint32_t block_begin;
+    uint32_t candidate_block_begin;
+    uint32_t candidate_block_end;
+} rinha_scan_window_t;
+
+typedef struct {
     bool initialized;
     bool enabled;
     uint64_t report_every;
@@ -160,26 +168,39 @@ static void rinha_index_profile_init(void) {
     }
 }
 
-static float rinha_distance_sq_scalar(
-    const float query[RINHA_DIM],
+static inline float rinha_distance_sq_scalar_preloaded(
+    float query0,
+    float query1,
+    float query2,
+    float query3,
+    float query4,
+    float query5,
+    float query6,
+    float query7,
+    float query8,
+    float query9,
+    float query10,
+    float query11,
+    float query12,
+    float query13,
     const rinha_vector_scalar_t *vector,
     const float *decode,
     float cutoff
 ) {
-    float diff0 = query[0] - decode[vector[0]];
-    float diff1 = query[1] - decode[vector[1]];
-    float diff2 = query[2] - decode[vector[2]];
-    float diff3 = query[3] - decode[vector[3]];
-    float diff4 = query[4] - decode[vector[4]];
-    float diff5 = query[5] - decode[vector[5]];
-    float diff6 = query[6] - decode[vector[6]];
-    float diff7 = query[7] - decode[vector[7]];
-    float diff8 = query[8] - decode[vector[8]];
-    float diff9 = query[9] - decode[vector[9]];
-    float diff10 = query[10] - decode[vector[10]];
-    float diff11 = query[11] - decode[vector[11]];
-    float diff12 = query[12] - decode[vector[12]];
-    float diff13 = query[13] - decode[vector[13]];
+    float diff0 = query0 - decode[vector[0]];
+    float diff1 = query1 - decode[vector[1]];
+    float diff2 = query2 - decode[vector[2]];
+    float diff3 = query3 - decode[vector[3]];
+    float diff4 = query4 - decode[vector[4]];
+    float diff5 = query5 - decode[vector[5]];
+    float diff6 = query6 - decode[vector[6]];
+    float diff7 = query7 - decode[vector[7]];
+    float diff8 = query8 - decode[vector[8]];
+    float diff9 = query9 - decode[vector[9]];
+    float diff10 = query10 - decode[vector[10]];
+    float diff11 = query11 - decode[vector[11]];
+    float diff12 = query12 - decode[vector[12]];
+    float diff13 = query13 - decode[vector[13]];
     float sum = 0.0f;
     diff0 *= diff0;
     sum += diff0;
@@ -287,14 +308,14 @@ static __m128 rinha_decode4_avx2(const rinha_vector_scalar_t *vector) {
 }
 
 __attribute__((target("avx2")))
-static float rinha_distance_sq_avx2(
-    const float query[RINHA_DIM],
+static float rinha_distance_sq_avx2_preloaded(
+    __m256 query0,
+    __m128 query1,
+    float query12,
+    float query13,
     const rinha_vector_scalar_t *vector,
-    const float *decode,
     float cutoff
 ) {
-    (void) decode;
-    __m256 query0 = _mm256_loadu_ps(query);
     __m256 values0 = rinha_decode8_avx2(vector);
     __m256 diff0 = _mm256_sub_ps(query0, values0);
     __m256 sum0 = _mm256_mul_ps(diff0, diff0);
@@ -303,7 +324,6 @@ static float rinha_distance_sq_avx2(
         return partial0;
     }
 
-    __m128 query1 = _mm_loadu_ps(query + 8);
     __m128 values1 = rinha_decode4_avx2(vector + 8);
     __m128 diff1 = _mm_sub_ps(query1, values1);
     __m128 sum1 = _mm_mul_ps(diff1, diff1);
@@ -312,8 +332,8 @@ static float rinha_distance_sq_avx2(
         return partial1;
     }
 
-    float diff12 = query[12] - rinha_dequantize_scalar(vector[12]);
-    float diff13 = query[13] - rinha_dequantize_scalar(vector[13]);
+    float diff12 = query12 - rinha_dequantize_scalar(vector[12]);
+    float diff13 = query13 - rinha_dequantize_scalar(vector[13]);
     return partial1 + diff12 * diff12 + diff13 * diff13;
 }
 
@@ -330,20 +350,6 @@ static float rinha_distance_sq_float_avx2(const float *lhs, const float *rhs) {
     return rinha_reduce_m256(sum0) + rinha_reduce_m128(sum1) + diff12 * diff12 + diff13 * diff13;
 }
 #endif
-
-static float rinha_distance_sq(
-    const float query[RINHA_DIM],
-    const rinha_vector_scalar_t *vector,
-    const float *decode,
-    float cutoff
-) {
-#if defined(__x86_64__) || defined(__i386__)
-    if (rinha_cpu_has_avx2()) {
-        return rinha_distance_sq_avx2(query, vector, decode, cutoff);
-    }
-#endif
-    return rinha_distance_sq_scalar(query, vector, decode, cutoff);
-}
 
 static float rinha_distance_sq_float(const float *lhs, const float *rhs, size_t dim) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -531,42 +537,75 @@ static uint32_t rinha_find_first_block_with_min_gt(
     return begin;
 }
 
-static uint32_t rinha_scan_list(
+static bool rinha_prepare_scan_window(
     const rinha_index_t *index,
-    const float query[RINHA_DIM],
-    const float *decode,
     uint32_t list,
     float centroid_dist,
-    float best_dist[5],
-    uint8_t best_label[5]
+    float cutoff_sq,
+    rinha_scan_window_t *window
 ) {
     uint32_t start = index->list_offsets[list];
     uint32_t end = index->list_offsets[list + 1u];
     if (start >= end) {
-        return 0u;
+        return false;
     }
 
-    const rinha_vector_scalar_t *vectors = index->vectors;
-    const uint8_t *labels = index->labels;
-    const float *block_min_radii = index->block_min_radii;
-    const float *block_max_radii = index->block_max_radii;
     uint32_t block_begin = index->list_block_offsets[list];
     uint32_t block_end = index->list_block_offsets[list + 1u];
     if (block_begin >= block_end) {
-        return 0u;
+        return false;
     }
 
-    uint32_t scanned = 0u;
-    float initial_cutoff_dist = best_dist[4] < FLT_MAX ? sqrtf(best_dist[4]) : FLT_MAX;
+    float initial_cutoff_dist = cutoff_sq < FLT_MAX ? sqrtf(cutoff_sq) : FLT_MAX;
     float lower = initial_cutoff_dist < FLT_MAX && centroid_dist > initial_cutoff_dist ?
         centroid_dist - initial_cutoff_dist : 0.0f;
     float upper = initial_cutoff_dist < FLT_MAX ? centroid_dist + initial_cutoff_dist : FLT_MAX;
     uint32_t candidate_block_begin = lower > 0.0f ?
-        rinha_find_first_block_with_max_ge(block_max_radii, block_begin, block_end, lower) : block_begin;
+        rinha_find_first_block_with_max_ge(index->block_max_radii, block_begin, block_end, lower) : block_begin;
     uint32_t candidate_block_end = upper < FLT_MAX ?
-        rinha_find_first_block_with_min_gt(block_min_radii, candidate_block_begin, block_end, upper) : block_end;
+        rinha_find_first_block_with_min_gt(index->block_min_radii, candidate_block_begin, block_end, upper) : block_end;
+    if (candidate_block_begin >= candidate_block_end) {
+        return false;
+    }
 
-    for (uint32_t block = candidate_block_begin; block < candidate_block_end; block++) {
+    window->start = start;
+    window->end = end;
+    window->block_begin = block_begin;
+    window->candidate_block_begin = candidate_block_begin;
+    window->candidate_block_end = candidate_block_end;
+    return true;
+}
+
+static uint32_t rinha_scan_window_scalar(
+    const rinha_index_t *index,
+    const rinha_scan_window_t *window,
+    const float query[RINHA_DIM],
+    const float *decode,
+    float centroid_dist,
+    float best_dist[5],
+    uint8_t best_label[5]
+) {
+    const rinha_vector_scalar_t *vectors = index->vectors;
+    const uint8_t *labels = index->labels;
+    const float *block_min_radii = index->block_min_radii;
+    const float *block_max_radii = index->block_max_radii;
+    float query0 = query[0];
+    float query1 = query[1];
+    float query2 = query[2];
+    float query3 = query[3];
+    float query4 = query[4];
+    float query5 = query[5];
+    float query6 = query[6];
+    float query7 = query[7];
+    float query8 = query[8];
+    float query9 = query[9];
+    float query10 = query[10];
+    float query11 = query[11];
+    float query12 = query[12];
+    float query13 = query[13];
+    uint32_t scanned = 0u;
+
+    for (uint32_t block = window->candidate_block_begin; block < window->candidate_block_end; block++) {
         if (best_dist[4] < FLT_MAX) {
             float cutoff_dist = sqrtf(best_dist[4]);
             float current_lower = centroid_dist > cutoff_dist ? centroid_dist - cutoff_dist : 0.0f;
@@ -579,23 +618,105 @@ static uint32_t rinha_scan_list(
             }
         }
 
-        uint32_t local_block = block - block_begin;
-        uint32_t item_start = start + local_block * RINHA_IVF_BLOCK_SIZE;
+        uint32_t local_block = block - window->block_begin;
+        uint32_t item_start = window->start + local_block * RINHA_IVF_BLOCK_SIZE;
         uint32_t item_end = item_start + RINHA_IVF_BLOCK_SIZE;
-        if (item_end > end) {
-            item_end = end;
+        if (item_end > window->end) {
+            item_end = window->end;
         }
 
+        scanned += item_end - item_start;
         for (uint32_t item = item_start; item < item_end; item++) {
             const rinha_vector_scalar_t *vector = vectors + (size_t) item * RINHA_DIM;
-            float exact_distance = rinha_distance_sq(query, vector, decode, best_dist[4]);
-            scanned++;
+            float exact_distance = rinha_distance_sq_scalar_preloaded(
+                query0, query1, query2, query3, query4, query5, query6,
+                query7, query8, query9, query10, query11, query12, query13,
+                vector, decode, best_dist[4]
+            );
             if (exact_distance < best_dist[4]) {
                 rinha_insert_top5(best_dist, best_label, exact_distance, labels[item]);
             }
         }
     }
     return scanned;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+static uint32_t rinha_scan_window_avx2(
+    const rinha_index_t *index,
+    const rinha_scan_window_t *window,
+    const float query[RINHA_DIM],
+    float centroid_dist,
+    float best_dist[5],
+    uint8_t best_label[5]
+) {
+    const rinha_vector_scalar_t *vectors = index->vectors;
+    const uint8_t *labels = index->labels;
+    const float *block_min_radii = index->block_min_radii;
+    const float *block_max_radii = index->block_max_radii;
+    __m256 query0 = _mm256_loadu_ps(query);
+    __m128 query1 = _mm_loadu_ps(query + 8);
+    float query12 = query[12];
+    float query13 = query[13];
+    uint32_t scanned = 0u;
+
+    for (uint32_t block = window->candidate_block_begin; block < window->candidate_block_end; block++) {
+        if (best_dist[4] < FLT_MAX) {
+            float cutoff_dist = sqrtf(best_dist[4]);
+            float current_lower = centroid_dist > cutoff_dist ? centroid_dist - cutoff_dist : 0.0f;
+            float current_upper = centroid_dist + cutoff_dist;
+            if (block_max_radii[block] < current_lower) {
+                continue;
+            }
+            if (block_min_radii[block] > current_upper) {
+                break;
+            }
+        }
+
+        uint32_t local_block = block - window->block_begin;
+        uint32_t item_start = window->start + local_block * RINHA_IVF_BLOCK_SIZE;
+        uint32_t item_end = item_start + RINHA_IVF_BLOCK_SIZE;
+        if (item_end > window->end) {
+            item_end = window->end;
+        }
+
+        scanned += item_end - item_start;
+        for (uint32_t item = item_start; item < item_end; item++) {
+            const rinha_vector_scalar_t *vector = vectors + (size_t) item * RINHA_DIM;
+            float exact_distance = rinha_distance_sq_avx2_preloaded(query0, query1, query12, query13, vector, best_dist[4]);
+            if (exact_distance < best_dist[4]) {
+                rinha_insert_top5(best_dist, best_label, exact_distance, labels[item]);
+            }
+        }
+    }
+    return scanned;
+}
+#endif
+
+static uint32_t rinha_scan_list(
+    const rinha_index_t *index,
+    const float query[RINHA_DIM],
+    const float *decode,
+    uint32_t list,
+    float centroid_dist,
+    bool use_avx2,
+    float best_dist[5],
+    uint8_t best_label[5]
+) {
+    rinha_scan_window_t window;
+    if (!rinha_prepare_scan_window(index, list, centroid_dist, best_dist[4], &window)) {
+        return 0u;
+    }
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (use_avx2) {
+        return rinha_scan_window_avx2(index, &window, query, centroid_dist, best_dist, best_label);
+    }
+#else
+    (void) use_avx2;
+#endif
+    return rinha_scan_window_scalar(index, &window, query, decode, centroid_dist, best_dist, best_label);
 }
 
 int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_DIM]) {
@@ -619,6 +740,11 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     uint64_t vectors_scanned_candidate = 0u;
 
     const float *decode = rinha_dequantize_lut();
+#if defined(__x86_64__) || defined(__i386__)
+    bool use_avx2 = rinha_cpu_has_avx2();
+#else
+    bool use_avx2 = false;
+#endif
     float centroid_dist_sq[RINHA_IVF_NLIST];
     rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE];
     rinha_list_candidate_t candidate_lists[RINHA_IVF_NLIST - RINHA_IVF_NPROBE];
@@ -646,7 +772,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
             continue;
         }
         probe_lists_scanned++;
-        vectors_scanned_probe += rinha_scan_list(index, query, decode, list, centroid_dist, best_dist, best_label);
+        vectors_scanned_probe += rinha_scan_list(index, query, decode, list, centroid_dist, use_avx2, best_dist, best_label);
     }
     if (profile_enabled) {
         probe_scan_ns = rinha_now_ns() - phase_start_ns;
@@ -696,7 +822,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         candidate_lists_scanned++;
         uint32_t list = candidate_lists[i].list;
         float centroid_dist = sqrtf(centroid_dist_sq[list]);
-        vectors_scanned_candidate += rinha_scan_list(index, query, decode, list, centroid_dist, best_dist, best_label);
+        vectors_scanned_candidate += rinha_scan_list(index, query, decode, list, centroid_dist, use_avx2, best_dist, best_label);
     }
     if (profile_enabled) {
         candidate_scan_ns = rinha_now_ns() - phase_start_ns;
