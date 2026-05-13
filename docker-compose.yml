@@ -20,7 +20,7 @@ services:
       resources:
         limits:
           cpus: "0.10"
-          memory: "48MB"
+          memory: "50MB"
     volumes:
       - rinha-sockets:/run/rinha
     networks:
@@ -44,7 +44,7 @@ services:
       resources:
         limits:
           cpus: "0.30"
-          memory: "151MB"
+          memory: "100MB"
     volumes:
       - rinha-sockets:/run/rinha
     networks:
@@ -68,7 +68,7 @@ services:
       resources:
         limits:
           cpus: "0.30"
-          memory: "151MB"
+          memory: "100MB"
     volumes:
       - rinha-sockets:/run/rinha
     networks:
@@ -92,7 +92,7 @@ services:
       resources:
         limits:
           cpus: "0.30"
-          memory: "151MB"
+          memory: "100MB"
     volumes:
       - rinha-sockets:/run/rinha
     networks:
