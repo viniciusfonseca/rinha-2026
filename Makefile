@@ -95,4 +95,7 @@ run-test: test
 clean:
 	rm -rf $(BIN_DIR)
 
+publish:
+	docker buildx build --platform linux/amd64 -t distanteagle16/rinha-2026:latest --push .
+
 .PHONY: all test up down up-macos down-macos test-ci test-ci-macos run-test clean
