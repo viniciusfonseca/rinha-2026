@@ -12,6 +12,7 @@ x-api: &api
     RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
   security_opt:
     - seccomp=unconfined
+  
   deploy:
     resources:
       limits:
@@ -52,6 +53,7 @@ services:
       - rinha-sockets:/run/rinha
     networks:
       - rinha
+    cpuset: "0,2"
 
   api1:
     <<: *api
@@ -60,6 +62,7 @@ services:
       API_SOCKET_PATH: /run/rinha/api1.sock
       RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
       RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
+    cpuset: "0,1"
 
   api2:
     <<: *api
@@ -68,7 +71,7 @@ services:
       API_SOCKET_PATH: /run/rinha/api2.sock
       RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
       RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
-
+    cpuset: "2,3"
   # api3:
   #   <<: *api
   #   environment:
