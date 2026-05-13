@@ -35,7 +35,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 - `src/index.c`
   - abre e consulta o indice vetorial serializado
   - usa SIMD AVX2 no hot path de distancia quando a arquitetura suporta
-  - poda por raio as listas fora do seed, ordena as sobreviventes por `lower bound` e usa parada antecipada
+  - poda por raio as listas fora do seed, ordena as sobreviventes por `lower bound`, usa parada antecipada e corta a distancia candidata assim que ela ja nao pode entrar no `top-5`
 
 - `src/common.h`
   - concentra parametros globais e tipos de quantizacao em 16 bits

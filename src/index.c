@@ -23,7 +23,12 @@ typedef struct {
     uint32_t list;
 } rinha_list_candidate_t;
 
-static float rinha_distance_sq_scalar(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+static float rinha_distance_sq_scalar(
+    const float query[RINHA_DIM],
+    const rinha_vector_scalar_t *vector,
+    const float *decode,
+    float cutoff
+) {
     float diff0 = query[0] - decode[vector[0]];
     float diff1 = query[1] - decode[vector[1]];
     float diff2 = query[2] - decode[vector[2]];
@@ -38,20 +43,49 @@ static float rinha_distance_sq_scalar(const float query[RINHA_DIM], const rinha_
     float diff11 = query[11] - decode[vector[11]];
     float diff12 = query[12] - decode[vector[12]];
     float diff13 = query[13] - decode[vector[13]];
-    return diff0 * diff0 +
-        diff1 * diff1 +
-        diff2 * diff2 +
-        diff3 * diff3 +
-        diff4 * diff4 +
-        diff5 * diff5 +
-        diff6 * diff6 +
-        diff7 * diff7 +
-        diff8 * diff8 +
-        diff9 * diff9 +
-        diff10 * diff10 +
-        diff11 * diff11 +
-        diff12 * diff12 +
-        diff13 * diff13;
+    float sum = 0.0f;
+    diff0 *= diff0;
+    sum += diff0;
+    if (sum >= cutoff) return sum;
+    diff1 *= diff1;
+    sum += diff1;
+    if (sum >= cutoff) return sum;
+    diff2 *= diff2;
+    sum += diff2;
+    if (sum >= cutoff) return sum;
+    diff3 *= diff3;
+    sum += diff3;
+    if (sum >= cutoff) return sum;
+    diff4 *= diff4;
+    sum += diff4;
+    if (sum >= cutoff) return sum;
+    diff5 *= diff5;
+    sum += diff5;
+    if (sum >= cutoff) return sum;
+    diff6 *= diff6;
+    sum += diff6;
+    if (sum >= cutoff) return sum;
+    diff7 *= diff7;
+    sum += diff7;
+    if (sum >= cutoff) return sum;
+    diff8 *= diff8;
+    sum += diff8;
+    if (sum >= cutoff) return sum;
+    diff9 *= diff9;
+    sum += diff9;
+    if (sum >= cutoff) return sum;
+    diff10 *= diff10;
+    sum += diff10;
+    if (sum >= cutoff) return sum;
+    diff11 *= diff11;
+    sum += diff11;
+    if (sum >= cutoff) return sum;
+    diff12 *= diff12;
+    sum += diff12;
+    if (sum >= cutoff) return sum;
+    diff13 *= diff13;
+    sum += diff13;
+    return sum;
 }
 
 static float rinha_distance_sq_float_scalar(const float *lhs, const float *rhs, size_t dim) {
@@ -116,21 +150,34 @@ static __m128 rinha_decode4_avx2(const rinha_vector_scalar_t *vector) {
 }
 
 __attribute__((target("avx2")))
-static float rinha_distance_sq_avx2(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+static float rinha_distance_sq_avx2(
+    const float query[RINHA_DIM],
+    const rinha_vector_scalar_t *vector,
+    const float *decode,
+    float cutoff
+) {
     (void) decode;
     __m256 query0 = _mm256_loadu_ps(query);
     __m256 values0 = rinha_decode8_avx2(vector);
     __m256 diff0 = _mm256_sub_ps(query0, values0);
     __m256 sum0 = _mm256_mul_ps(diff0, diff0);
+    float partial0 = rinha_reduce_m256(sum0);
+    if (partial0 >= cutoff) {
+        return partial0;
+    }
 
     __m128 query1 = _mm_loadu_ps(query + 8);
     __m128 values1 = rinha_decode4_avx2(vector + 8);
     __m128 diff1 = _mm_sub_ps(query1, values1);
     __m128 sum1 = _mm_mul_ps(diff1, diff1);
+    float partial1 = partial0 + rinha_reduce_m128(sum1);
+    if (partial1 >= cutoff) {
+        return partial1;
+    }
 
     float diff12 = query[12] - rinha_dequantize_scalar(vector[12]);
     float diff13 = query[13] - rinha_dequantize_scalar(vector[13]);
-    return rinha_reduce_m256(sum0) + rinha_reduce_m128(sum1) + diff12 * diff12 + diff13 * diff13;
+    return partial1 + diff12 * diff12 + diff13 * diff13;
 }
 
 __attribute__((target("avx2")))
@@ -147,13 +194,18 @@ static float rinha_distance_sq_float_avx2(const float *lhs, const float *rhs) {
 }
 #endif
 
-static float rinha_distance_sq(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+static float rinha_distance_sq(
+    const float query[RINHA_DIM],
+    const rinha_vector_scalar_t *vector,
+    const float *decode,
+    float cutoff
+) {
 #if defined(__x86_64__) || defined(__i386__)
     if (rinha_cpu_has_avx2()) {
-        return rinha_distance_sq_avx2(query, vector, decode);
+        return rinha_distance_sq_avx2(query, vector, decode, cutoff);
     }
 #endif
-    return rinha_distance_sq_scalar(query, vector, decode);
+    return rinha_distance_sq_scalar(query, vector, decode, cutoff);
 }
 
 static float rinha_distance_sq_float(const float *lhs, const float *rhs, size_t dim) {
@@ -316,7 +368,7 @@ static void rinha_scan_list(
 
     for (uint32_t item = start; item < end; item++) {
         const rinha_vector_scalar_t *vector = index->vectors + (size_t) item * RINHA_DIM;
-        float exact_distance = rinha_distance_sq(query, vector, decode);
+        float exact_distance = rinha_distance_sq(query, vector, decode, best_dist[4]);
         rinha_insert_top5(best_dist, best_label, exact_distance, index->labels[item]);
     }
 }
