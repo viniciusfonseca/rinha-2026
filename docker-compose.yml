@@ -15,8 +15,10 @@ x-api: &api
   deploy:
     resources:
       limits:
-        cpus: "0.30"
-        memory: "100MB"
+        cpus: "0.45"
+        memory: "150MB"
+        # cpus: "0.30"
+        # memory: "100MB"
   volumes:
     - rinha-sockets:/run/rinha
   networks:
@@ -31,13 +33,14 @@ services:
     platform: linux/amd64
     command: ["/usr/local/bin/fraud_lb"]
     environment:
-      BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock,unix:/run/rinha/api3.sock
+      BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
+      # BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock,unix:/run/rinha/api3.sock
     ports:
       - "9999:9999"
     depends_on:
       - api1
       - api2
-      - api3
+      # - api3
     security_opt:
       - seccomp=unconfined
     deploy:
@@ -66,13 +69,13 @@ services:
       RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
       RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
 
-  api3:
-    <<: *api
-    environment:
-      RINHA_INDEX_PATH: /opt/rinha/index.bin
-      API_SOCKET_PATH: /run/rinha/api3.sock
-      RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
-      RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
+  # api3:
+  #   <<: *api
+  #   environment:
+  #     RINHA_INDEX_PATH: /opt/rinha/index.bin
+  #     API_SOCKET_PATH: /run/rinha/api3.sock
+  #     RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
+  #     RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
 
 volumes:
   rinha-sockets:

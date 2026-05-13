@@ -7,3 +7,6 @@ services:
 
   api2:
     platform: linux/arm64/v8
+
+  # api3:
+  #   platform: linux/arm64/v8
