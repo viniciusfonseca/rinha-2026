@@ -41,11 +41,11 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
   - Baixa o dataset oficial no build da imagem e gera `index.bin`.
-  - Hoje gera estrutura IVF enxuta com centroides, offsets por lista, raios por lista, labels e vetores quantizados em `16 bits`.
+  - Hoje gera estrutura IVF enxuta com centroides, offsets por lista, raios por lista, blocos por lista com `min/max radius`, labels e vetores quantizados em `16 bits`.
 
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
   - Consulta o `index.bin`.
-  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos, podar listas restantes por raio sem `sqrt`, ordenar so as sobreviventes por `lower bound` e parar cedo quando o `top-5` ja esta matematicamente fechado.
+  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos, podar listas restantes por raio sem `sqrt`, ordenar so as sobreviventes por `lower bound`, podar blocos intra-lista por faixa de raio e parar cedo quando o `top-5` ja esta matematicamente fechado.
   - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, e corta o calculo assim que a soma parcial ja passa do pior do `top-5`.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
@@ -57,6 +57,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
     - `RINHA_IVF_NPROBE = 4`
     - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
+    - `RINHA_IVF_BLOCK_SIZE = 64`
 
 - [src/quantize.c](/Users/viniciusfonseca/projects/rinha-2026/src/quantize.c)
   - Quantizacao/dequantizacao dos vetores armazenados no indice.
@@ -69,10 +70,11 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - Arquivo: [src/index_format.h](/Users/viniciusfonseca/projects/rinha-2026/src/index_format.h)
 - Versao atual:
-  - `RINHA_INDEX_MAGIC = "R26IVF9"`
-  - `RINHA_INDEX_VERSION = 9`
+  - `RINHA_INDEX_MAGIC = "R26IV10"`
+  - `RINHA_INDEX_VERSION = 10`
 - Mudancas mais recentes:
   - inclusao de `list_radii`
+  - inclusao de `list_block_offsets`, `block_min_radii` e `block_max_radii`
   - armazenamento de vetores quantizados em 16 bits
   - remocao do payload morto de `PQ` do arquivo serializado
 
@@ -149,7 +151,10 @@ Importante:
 - Ultima comparacao util com a telemetria:
   - antes do retuning para `NLIST=1024`, o indice ficava em ~`1.26ms` a `1.34ms` por request, com ~`115315` vetores escaneados por consulta
   - depois do retuning e do corte no `scan_list`, caiu para ~`0.81ms` a `0.84ms` por request, com ~`106762` vetores escaneados por consulta
-  - o maior custo continua sendo `candidate_scan`, mas caiu de ~`1.01ms`-`1.08ms` para ~`0.67ms`
+  - depois da poda intra-lista por blocos, caiu de ~`0.81ms`-`0.84ms` para ~`0.117ms`-`0.121ms` por request
+  - o maior custo continua sendo `probe_scan`, em ~`0.084ms`-`0.087ms`; `candidate_scan` caiu para ~`0.024ms`
+  - o volume medio caiu para ~`9391` vetores por request, sendo ~`8085` nas `probe lists` e ~`1306` nas `candidate lists`
+  - a poda por raio entre listas continua forte, com ~`992` listas descartadas antes do scan; depois disso, a poda intra-lista derruba o trabalho residual dentro das `28` listas candidatas sobreviventes
 
 ## Compose e Ambientes
 
@@ -181,7 +186,7 @@ Importante:
   - O compose monta um volume compartilhado em `/run/rinha`.
 
 - A API ja caiu em timeouts quando a busca degenerava para custo alto por request.
-  - Hoje a busca esta mais previsivel com listas ordenadas por lower bound, parada antecipada e poda por raio.
+  - Hoje a busca esta mais previsivel com listas ordenadas por lower bound, parada antecipada, poda por raio e poda intra-lista por blocos.
 
 - O `README.md` esta desatualizado em partes.
   - Ele ainda menciona LSH como estrategia principal.

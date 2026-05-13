@@ -45,6 +45,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - abre e consulta o indice vetorial serializado
   - usa SIMD AVX2 no hot path de distancia quando a arquitetura suporta
   - poda por raio as listas fora do seed, ordena as sobreviventes por `lower bound`, usa parada antecipada e corta a distancia candidata assim que ela ja nao pode entrar no `top-5`
+  - faz poda intra-lista por blocos ordenados por raio para evitar varrer listas candidatas inteiras
 
 - `src/common.h`
   - concentra dimensao do vetor, parametros globais do indice e `rinha_clamp01`
@@ -65,6 +66,7 @@ O estado atual e:
 - consulta com aquecimento das `nprobe` listas de centroides mais proximos
 - expansao exata em ordem de `lower bound` so para listas que ainda podem melhorar o `top-5`
 - varredura exata dentro das listas com poda por raio
+- cada lista e ordenada por raio no preprocess e quebrada em blocos com metadados `min/max radius` para poda intra-lista
 - arquivo serializado sem payload morto de `PQ`
 - vetores armazenados em `uint16_t` para reduzir memoria e manter boa fidelidade
 - em x86, o caminho de distancia usa SIMD AVX2 com dequantizacao direta em registrador; em outras arquiteturas existe fallback scalar

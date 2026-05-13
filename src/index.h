@@ -17,6 +17,9 @@ typedef struct {
     const float *coarse_centroids;
     const uint32_t *list_offsets;
     const float *list_radii;
+    const uint32_t *list_block_offsets;
+    const float *block_min_radii;
+    const float *block_max_radii;
     const uint8_t *labels;
     const rinha_vector_scalar_t *vectors;
 } rinha_index_t;

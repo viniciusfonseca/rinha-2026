@@ -39,6 +39,20 @@ Número de iterações do `k-means` no treino do índice.
 - Isso pode melhorar um pouco a qualidade da busca.
 - O custo também fica no build, não no runtime.
 
+### `RINHA_IVF_BLOCK_SIZE = 64`
+
+Quantidade de vetores agrupados em cada bloco interno de uma lista IVF.
+
+- Cada lista e ordenada por raio no preprocess.
+- Para cada bloco, o índice guarda apenas `min_radius` e `max_radius`.
+- Na consulta, isso permite pular blocos inteiros quando a faixa de raio do bloco não pode mais melhorar o `top-5`.
+
+Efeito prático:
+
+- Blocos menores aumentam a precisão da poda intra-lista.
+- Blocos menores também aumentam um pouco o metadado do índice e o custo de controle.
+- Blocos maiores reduzem metadado, mas deixam a poda mais grossa e podem fazer o scan voltar a crescer.
+
 ## Quantização
 
 ### `RINHA_VECTOR_QUANT_SCALE = 65534`
@@ -61,6 +75,7 @@ Sentinela para representar valor ausente.
 
 - `NPROBE` é o parâmetro que mais pesa em velocidade versus precisão durante a consulta.
 - `NLIST` define o tamanho médio das listas e a granularidade do índice.
+- `BLOCK_SIZE` define a granularidade da poda intra-lista.
 - `TRAIN_SAMPLES` e `KMEANS_ITERS` afetam principalmente a qualidade do índice gerado no build.
 - A quantização em `16 bits` reduz o erro de representação sem explodir o tamanho do índice.
 
@@ -68,5 +83,6 @@ Sentinela para representar valor ausente.
 
 - Quer mais velocidade: reduza `NPROBE`.
 - Quer mais precisão: aumente `NPROBE`.
+- Quer poda intra-lista mais fina: reduza `BLOCK_SIZE` com cuidado.
 - Quer melhor partição: aumente `TRAIN_SAMPLES` ou `KMEANS_ITERS`.
 - Quer menos erro numérico: mantenha a quantização em `16 bits`.

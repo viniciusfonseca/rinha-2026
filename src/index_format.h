@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define RINHA_INDEX_MAGIC "R26IVF9"
-#define RINHA_INDEX_VERSION 9u
+#define RINHA_INDEX_MAGIC "R26IV10"
+#define RINHA_INDEX_VERSION 10u
 
 typedef struct {
     char magic[8];
@@ -13,9 +13,13 @@ typedef struct {
     uint32_t dim;
     uint32_t nlist;
     uint32_t nprobe;
+    uint32_t block_size;
     uint64_t coarse_centroids_offset;
     uint64_t list_offsets_offset;
     uint64_t list_radii_offset;
+    uint64_t list_block_offsets_offset;
+    uint64_t block_min_radii_offset;
+    uint64_t block_max_radii_offset;
     uint64_t labels_offset;
     uint64_t vectors_offset;
 } rinha_index_header_t;

@@ -20,6 +20,13 @@ typedef struct {
     int pushback;
 } rinha_gz_reader_t;
 
+typedef struct {
+    float radius;
+    uint32_t order;
+    uint8_t label;
+    rinha_vector_scalar_t vector[RINHA_DIM];
+} rinha_grouped_item_t;
+
 static int rinha_reader_fill(rinha_gz_reader_t *reader) {
     reader->len = gzread(reader->file, reader->buffer, (unsigned) sizeof(reader->buffer));
     reader->pos = 0;
@@ -233,6 +240,24 @@ static void rinha_maybe_add_training_sample(
     rinha_decode_vector(vector, samples + (size_t) slot * RINHA_DIM);
 }
 
+static int rinha_compare_grouped_items(const void *lhs_ptr, const void *rhs_ptr) {
+    const rinha_grouped_item_t *lhs = (const rinha_grouped_item_t *) lhs_ptr;
+    const rinha_grouped_item_t *rhs = (const rinha_grouped_item_t *) rhs_ptr;
+    if (lhs->radius < rhs->radius) {
+        return -1;
+    }
+    if (lhs->radius > rhs->radius) {
+        return 1;
+    }
+    if (lhs->order < rhs->order) {
+        return -1;
+    }
+    if (lhs->order > rhs->order) {
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "uso: %s <references.json.gz> <index.bin>\n", argv[0]);
@@ -378,14 +403,16 @@ int main(int argc, char **argv) {
     free(sample_assignments);
 
     uint16_t *list_assignments = malloc((size_t) count * sizeof(uint16_t));
+    float *vector_radii = malloc((size_t) count * sizeof(float));
     uint32_t *list_sizes = calloc(RINHA_IVF_NLIST, sizeof(uint32_t));
     float *list_radii = calloc(RINHA_IVF_NLIST, sizeof(float));
-    if (list_assignments == NULL || list_sizes == NULL || list_radii == NULL) {
+    if (list_assignments == NULL || vector_radii == NULL || list_sizes == NULL || list_radii == NULL) {
         fprintf(stderr, "sem memoria para particionar listas IVF\n");
         free(vectors);
         free(labels);
         free(coarse_centroids);
         free(list_assignments);
+        free(vector_radii);
         free(list_sizes);
         free(list_radii);
         return 1;
@@ -404,6 +431,7 @@ int main(int argc, char **argv) {
             RINHA_DIM
         );
         float radius = sqrtf(radius_sq);
+        vector_radii[point] = radius;
         if (radius > list_radii[list]) {
             list_radii[list] = radius;
         }
@@ -416,6 +444,7 @@ int main(int argc, char **argv) {
         free(labels);
         free(coarse_centroids);
         free(list_assignments);
+        free(vector_radii);
         free(list_sizes);
         free(list_radii);
         return 1;
@@ -427,18 +456,21 @@ int main(int argc, char **argv) {
     }
 
     uint32_t *cursor = malloc((size_t) RINHA_IVF_NLIST * sizeof(uint32_t));
+    float *grouped_radii = malloc((size_t) count * sizeof(float));
     rinha_vector_scalar_t *grouped_vectors = malloc((size_t) count * RINHA_DIM * sizeof(rinha_vector_scalar_t));
     uint8_t *grouped_labels = malloc(count);
-    if (cursor == NULL || grouped_vectors == NULL || grouped_labels == NULL) {
+    if (cursor == NULL || grouped_radii == NULL || grouped_vectors == NULL || grouped_labels == NULL) {
         fprintf(stderr, "sem memoria para serializar IVF\n");
         free(vectors);
         free(labels);
         free(coarse_centroids);
         free(list_assignments);
+        free(vector_radii);
         free(list_sizes);
         free(list_radii);
         free(list_offsets);
         free(cursor);
+        free(grouped_radii);
         free(grouped_vectors);
         free(grouped_labels);
         return 1;
@@ -449,15 +481,137 @@ int main(int argc, char **argv) {
         uint16_t list = list_assignments[point];
         uint32_t position = cursor[list]++;
         const rinha_vector_scalar_t *vector = vectors + (size_t) point * RINHA_DIM;
+        grouped_radii[position] = vector_radii[point];
         memcpy(grouped_vectors + (size_t) position * RINHA_DIM, vector, RINHA_DIM * sizeof(rinha_vector_scalar_t));
         grouped_labels[position] = labels[point];
+    }
+
+    uint32_t max_list_size = 0u;
+    for (size_t list = 0; list < RINHA_IVF_NLIST; list++) {
+        if (list_sizes[list] > max_list_size) {
+            max_list_size = list_sizes[list];
+        }
+    }
+
+    rinha_grouped_item_t *sort_buffer = max_list_size > 0u ?
+        malloc((size_t) max_list_size * sizeof(rinha_grouped_item_t)) : NULL;
+    if (max_list_size > 0u && sort_buffer == NULL) {
+        fprintf(stderr, "sem memoria para ordenar listas IVF\n");
+        free(vectors);
+        free(labels);
+        free(coarse_centroids);
+        free(list_assignments);
+        free(vector_radii);
+        free(list_sizes);
+        free(list_radii);
+        free(list_offsets);
+        free(cursor);
+        free(grouped_radii);
+        free(grouped_vectors);
+        free(grouped_labels);
+        return 1;
+    }
+
+    for (size_t list = 0; list < RINHA_IVF_NLIST; list++) {
+        uint32_t start = list_offsets[list];
+        uint32_t end = list_offsets[list + 1u];
+        uint32_t size = end - start;
+        if (size <= 1u) {
+            continue;
+        }
+
+        for (uint32_t i = 0; i < size; i++) {
+            uint32_t position = start + i;
+            sort_buffer[i].radius = grouped_radii[position];
+            sort_buffer[i].order = position;
+            sort_buffer[i].label = grouped_labels[position];
+            memcpy(
+                sort_buffer[i].vector,
+                grouped_vectors + (size_t) position * RINHA_DIM,
+                RINHA_DIM * sizeof(rinha_vector_scalar_t)
+            );
+        }
+
+        qsort(sort_buffer, size, sizeof(sort_buffer[0]), rinha_compare_grouped_items);
+
+        for (uint32_t i = 0; i < size; i++) {
+            uint32_t position = start + i;
+            grouped_radii[position] = sort_buffer[i].radius;
+            grouped_labels[position] = sort_buffer[i].label;
+            memcpy(
+                grouped_vectors + (size_t) position * RINHA_DIM,
+                sort_buffer[i].vector,
+                RINHA_DIM * sizeof(rinha_vector_scalar_t)
+            );
+        }
     }
 
     free(vectors);
     free(labels);
     free(list_assignments);
-    free(list_sizes);
+    free(vector_radii);
     free(cursor);
+
+    uint32_t *list_block_offsets = malloc((size_t) (RINHA_IVF_NLIST + 1u) * sizeof(uint32_t));
+    if (list_block_offsets == NULL) {
+        fprintf(stderr, "sem memoria para blocos IVF\n");
+        free(coarse_centroids);
+        free(list_sizes);
+        free(list_offsets);
+        free(list_radii);
+        free(sort_buffer);
+        free(grouped_radii);
+        free(grouped_vectors);
+        free(grouped_labels);
+        return 1;
+    }
+
+    list_block_offsets[0] = 0u;
+    for (size_t list = 0; list < RINHA_IVF_NLIST; list++) {
+        uint32_t list_size = list_sizes[list];
+        uint32_t block_count = (list_size + RINHA_IVF_BLOCK_SIZE - 1u) / RINHA_IVF_BLOCK_SIZE;
+        list_block_offsets[list + 1u] = list_block_offsets[list] + block_count;
+    }
+
+    uint32_t total_blocks = list_block_offsets[RINHA_IVF_NLIST];
+    float *block_min_radii = malloc((size_t) total_blocks * sizeof(float));
+    float *block_max_radii = malloc((size_t) total_blocks * sizeof(float));
+    if (block_min_radii == NULL || block_max_radii == NULL) {
+        fprintf(stderr, "sem memoria para metadados de blocos IVF\n");
+        free(coarse_centroids);
+        free(list_sizes);
+        free(list_offsets);
+        free(list_radii);
+        free(list_block_offsets);
+        free(block_min_radii);
+        free(block_max_radii);
+        free(sort_buffer);
+        free(grouped_radii);
+        free(grouped_vectors);
+        free(grouped_labels);
+        return 1;
+    }
+
+    for (size_t list = 0; list < RINHA_IVF_NLIST; list++) {
+        uint32_t list_start = list_offsets[list];
+        uint32_t list_end = list_offsets[list + 1u];
+        uint32_t block_start = list_block_offsets[list];
+        uint32_t block_end = list_block_offsets[list + 1u];
+        for (uint32_t block = block_start; block < block_end; block++) {
+            uint32_t local_block = block - block_start;
+            uint32_t item_start = list_start + local_block * RINHA_IVF_BLOCK_SIZE;
+            uint32_t item_end = item_start + RINHA_IVF_BLOCK_SIZE;
+            if (item_end > list_end) {
+                item_end = list_end;
+            }
+            block_min_radii[block] = grouped_radii[item_start];
+            block_max_radii[block] = grouped_radii[item_end - 1u];
+        }
+    }
+
+    free(grouped_radii);
+    free(list_sizes);
+    free(sort_buffer);
 
     FILE *out = fopen(argv[2], "wb");
     if (out == NULL) {
@@ -465,6 +619,9 @@ int main(int argc, char **argv) {
         free(coarse_centroids);
         free(list_offsets);
         free(list_radii);
+        free(list_block_offsets);
+        free(block_min_radii);
+        free(block_max_radii);
         free(grouped_vectors);
         free(grouped_labels);
         return 1;
@@ -477,19 +634,29 @@ int main(int argc, char **argv) {
     header.dim = RINHA_DIM;
     header.nlist = RINHA_IVF_NLIST;
     header.nprobe = RINHA_IVF_NPROBE;
+    header.block_size = RINHA_IVF_BLOCK_SIZE;
     header.coarse_centroids_offset = sizeof(header);
     header.list_offsets_offset = header.coarse_centroids_offset +
         (uint64_t) RINHA_IVF_NLIST * RINHA_DIM * sizeof(float);
     header.list_radii_offset = header.list_offsets_offset +
         (uint64_t) (RINHA_IVF_NLIST + 1u) * sizeof(uint32_t);
-    header.labels_offset = header.list_radii_offset +
+    header.list_block_offsets_offset = header.list_radii_offset +
         (uint64_t) RINHA_IVF_NLIST * sizeof(float);
+    header.block_min_radii_offset = header.list_block_offsets_offset +
+        (uint64_t) (RINHA_IVF_NLIST + 1u) * sizeof(uint32_t);
+    header.block_max_radii_offset = header.block_min_radii_offset +
+        (uint64_t) total_blocks * sizeof(float);
+    header.labels_offset = header.block_max_radii_offset +
+        (uint64_t) total_blocks * sizeof(float);
     header.vectors_offset = header.labels_offset + count;
 
     fwrite(&header, sizeof(header), 1, out);
     fwrite(coarse_centroids, sizeof(float), (size_t) RINHA_IVF_NLIST * RINHA_DIM, out);
     fwrite(list_offsets, sizeof(uint32_t), RINHA_IVF_NLIST + 1u, out);
     fwrite(list_radii, sizeof(float), RINHA_IVF_NLIST, out);
+    fwrite(list_block_offsets, sizeof(uint32_t), RINHA_IVF_NLIST + 1u, out);
+    fwrite(block_min_radii, sizeof(float), total_blocks, out);
+    fwrite(block_max_radii, sizeof(float), total_blocks, out);
     fwrite(grouped_labels, 1, count, out);
     fwrite(grouped_vectors, sizeof(rinha_vector_scalar_t), (size_t) count * RINHA_DIM, out);
     fclose(out);
@@ -497,6 +664,9 @@ int main(int argc, char **argv) {
     free(coarse_centroids);
     free(list_offsets);
     free(list_radii);
+    free(list_block_offsets);
+    free(block_min_radii);
+    free(block_max_radii);
     free(grouped_vectors);
     free(grouped_labels);
     return 0;
