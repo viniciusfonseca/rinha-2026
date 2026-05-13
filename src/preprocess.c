@@ -1,10 +1,12 @@
 #include "common.h"
 #include "index_format.h"
+#include "quantize.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

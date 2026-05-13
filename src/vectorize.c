@@ -1,85 +1,10 @@
-#include "vectorize.h"
+#include "vectorize_payload.h"
 
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef struct {
-    const char *start;
-    const char *end;
-} rinha_span_t;
-
-typedef struct {
-    int year;
-    int month;
-    int day;
-    int hour;
-    int minute;
-    int second;
-} rinha_timestamp_t;
-
-typedef struct {
-    double amount;
-    int installments;
-    rinha_timestamp_t requested_at;
-
-    double customer_avg_amount;
-    int tx_count_24h;
-    rinha_span_t known_merchants;
-
-    char merchant_id[32];
-    size_t merchant_id_len;
-    uint32_t merchant_mcc_code;
-    double merchant_avg_amount;
-    bool merchant_known;
-
-    bool is_online;
-    bool card_present;
-    double km_from_home;
-
-    bool has_last_transaction;
-    rinha_timestamp_t last_timestamp;
-    double km_from_current;
-
-    bool amount_set;
-    bool installments_set;
-    bool requested_at_set;
-    bool customer_avg_amount_set;
-    bool tx_count_24h_set;
-    bool known_merchants_set;
-    bool merchant_id_set;
-    bool merchant_mcc_set;
-    bool merchant_avg_amount_set;
-    bool is_online_set;
-    bool card_present_set;
-    bool km_from_home_set;
-    bool last_timestamp_set;
-    bool km_from_current_set;
-    bool transaction_set;
-    bool customer_set;
-    bool merchant_set;
-    bool terminal_set;
-    bool last_transaction_set;
-} rinha_tx_payload_t;
-
-static const struct {
-    double max_amount;
-    double max_installments;
-    double amount_vs_avg_ratio;
-    double max_minutes;
-    double max_km;
-    double max_tx_count_24h;
-    double max_merchant_avg_amount;
-} RINHA_NORMALIZATION = {
-    .max_amount = 10000.0,
-    .max_installments = 12.0,
-    .amount_vs_avg_ratio = 10.0,
-    .max_minutes = 1440.0,
-    .max_km = 1000.0,
-    .max_tx_count_24h = 20.0,
-    .max_merchant_avg_amount = 10000.0,
-};
 
 static const char *rinha_skip_ws(const char *p, const char *end) {
     while (p < end && isspace((unsigned char) *p)) {
@@ -407,33 +332,6 @@ static bool rinha_array_contains_string(rinha_span_t array, const char *needle, 
     }
 }
 
-static float rinha_lookup_mcc_risk(uint32_t code) {
-    switch (code) {
-        case ('5' << 24) | ('4' << 16) | ('1' << 8) | '1':
-            return 0.15f;
-        case ('5' << 24) | ('8' << 16) | ('1' << 8) | '2':
-            return 0.30f;
-        case ('5' << 24) | ('9' << 16) | ('1' << 8) | '2':
-            return 0.20f;
-        case ('5' << 24) | ('9' << 16) | ('4' << 8) | '4':
-            return 0.45f;
-        case ('7' << 24) | ('8' << 16) | ('0' << 8) | '1':
-            return 0.80f;
-        case ('7' << 24) | ('8' << 16) | ('0' << 8) | '2':
-            return 0.75f;
-        case ('7' << 24) | ('9' << 16) | ('9' << 8) | '5':
-            return 0.85f;
-        case ('4' << 24) | ('5' << 16) | ('1' << 8) | '1':
-            return 0.35f;
-        case ('5' << 24) | ('3' << 16) | ('1' << 8) | '1':
-            return 0.25f;
-        case ('5' << 24) | ('9' << 16) | ('9' << 8) | '9':
-            return 0.50f;
-        default:
-            return 0.5f;
-    }
-}
-
 static bool rinha_parse_transaction_object(const char **cursor, const char *end, rinha_tx_payload_t *payload) {
     const char *p = rinha_skip_ws(*cursor, end);
     if (p >= end || *p != '{') {
@@ -752,7 +650,7 @@ static bool rinha_parse_last_transaction_object(const char **cursor, const char 
     }
 }
 
-static bool rinha_parse_payload(const char *json, size_t len, rinha_tx_payload_t *payload) {
+bool rinha_parse_tx_payload(const char *json, size_t len, rinha_tx_payload_t *payload) {
     memset(payload, 0, sizeof(*payload));
 
     const char *p = rinha_skip_ws(json, json + len);
@@ -846,63 +744,5 @@ static bool rinha_parse_payload(const char *json, size_t len, rinha_tx_payload_t
         payload->merchant_id,
         payload->merchant_id_len
     );
-    return true;
-}
-
-bool rinha_request_to_vector(const char *json, size_t len, float out[RINHA_DIM]) {
-    rinha_tx_payload_t payload;
-    if (!rinha_parse_payload(json, len, &payload)) {
-        return false;
-    }
-
-    out[0] = rinha_clamp01(payload.amount / RINHA_NORMALIZATION.max_amount);
-    out[1] = rinha_clamp01((double) payload.installments / RINHA_NORMALIZATION.max_installments);
-
-    if (payload.customer_avg_amount <= 0.0) {
-        out[2] = 1.0f;
-    } else {
-        double ratio = (payload.amount / payload.customer_avg_amount) / RINHA_NORMALIZATION.amount_vs_avg_ratio;
-        out[2] = rinha_clamp01(ratio);
-    }
-
-    out[3] = (float) payload.requested_at.hour / 23.0f;
-    out[4] = (float) rinha_weekday_monday0(payload.requested_at.year, payload.requested_at.month, payload.requested_at.day) / 6.0f;
-
-    if (!payload.has_last_transaction) {
-        out[5] = -1.0f;
-        out[6] = -1.0f;
-    } else {
-        int64_t request_minutes = rinha_epoch_minutes_utc(
-            payload.requested_at.year,
-            payload.requested_at.month,
-            payload.requested_at.day,
-            payload.requested_at.hour,
-            payload.requested_at.minute,
-            payload.requested_at.second
-        );
-        int64_t last_minutes = rinha_epoch_minutes_utc(
-            payload.last_timestamp.year,
-            payload.last_timestamp.month,
-            payload.last_timestamp.day,
-            payload.last_timestamp.hour,
-            payload.last_timestamp.minute,
-            payload.last_timestamp.second
-        );
-        double diff_minutes = (double) (request_minutes - last_minutes);
-        if (diff_minutes < 0.0) {
-            diff_minutes = 0.0;
-        }
-
-        out[5] = rinha_clamp01(diff_minutes / RINHA_NORMALIZATION.max_minutes);
-        out[6] = rinha_clamp01(payload.km_from_current / RINHA_NORMALIZATION.max_km);
-    }
-
-    out[7] = rinha_clamp01(payload.km_from_home / RINHA_NORMALIZATION.max_km);
-    out[8] = rinha_clamp01((double) payload.tx_count_24h / RINHA_NORMALIZATION.max_tx_count_24h);
-    out[9] = payload.is_online ? 1.0f : 0.0f;
-    out[10] = payload.card_present ? 1.0f : 0.0f;
-    out[11] = payload.merchant_known ? 0.0f : 1.0f;
-    out[12] = rinha_lookup_mcc_risk(payload.merchant_mcc_code);
-    out[13] = rinha_clamp01(payload.merchant_avg_amount / RINHA_NORMALIZATION.max_merchant_avg_amount);
     return true;
 }

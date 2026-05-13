@@ -18,7 +18,11 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Mantem `keep-alive` por padrao, a menos que receba `Connection: close`.
   - Usa `generation` em `user_data` para descartar CQEs antigos quando um slot de conexao e reutilizado.
   - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
-  - Faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
+  - Orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
+
+- [src/api_http.c](/Users/viniciusfonseca/projects/rinha-2026/src/api_http.c)
+  - Parser HTTP pequeno para `GET /ready` e `POST /fraud-score`.
+  - Centraliza deteccao de rota, `Content-Length`, corpo e `keep-alive`.
 
 - [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
   - Proxy TCP round-robin para clientes e proxy via unix sockets para as APIs.
@@ -28,7 +32,12 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Foi ajustado para caber no limite de memoria do LB.
 
 - [src/vectorize.c](/Users/viniciusfonseca/projects/rinha-2026/src/vectorize.c)
-  - Converte o payload da Rinha em vetor de 14 dimensoes.
+  - Parser JSON especializado do payload da Rinha.
+  - Preenche `rinha_tx_payload_t` sem alocar memoria dinamica.
+
+- [src/vector_features.c](/Users/viniciusfonseca/projects/rinha-2026/src/vector_features.c)
+  - Converte `rinha_tx_payload_t` em vetor de 14 dimensoes.
+  - Centraliza normalizacao e riscos por MCC.
 
 - [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
   - Baixa o dataset oficial no build da imagem e gera `index.bin`.
@@ -42,13 +51,19 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
 
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
-  - Parametros globais do indice e quantizacao em 16 bits.
+  - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
     - `RINHA_IVF_NLIST = 512`
     - `RINHA_IVF_NPROBE = 4`
     - `RINHA_IVF_TRAIN_SAMPLES = 65536`
     - `RINHA_IVF_KMEANS_ITERS = 16`
-    - vetores armazenados em `uint16_t` via `rinha_vector_scalar_t`
+
+- [src/quantize.c](/Users/viniciusfonseca/projects/rinha-2026/src/quantize.c)
+  - Quantizacao/dequantizacao dos vetores armazenados no indice.
+  - Vetores persistidos em `uint16_t` via `rinha_vector_scalar_t`.
+
+- [src/time_utils.c](/Users/viniciusfonseca/projects/rinha-2026/src/time_utils.c)
+  - Helpers de calendario usados pela vetorizacao.
 
 ## Formato do Indice
 
@@ -64,6 +79,16 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 Sempre que mudar o formato serializado, atualizar esse header e regenerar `index.bin`.
 
 ## Estado Validado Mais Recente
+
+Validacao funcional apos a refatoracao modular:
+
+- `docker build --platform linux/amd64 -t rinha-refactor-check .`
+  - build estatico passou com `-mavx2` ativo no alvo `x86_64`
+  - preprocess regenerou `index.bin` com `3000000` vetores
+- `docker-compose.yml` + `docker-compose.macos.yml`
+  - build `linux/arm64/v8` passou sem `-mavx2`
+  - smoke passou em `GET /ready` com `204`
+  - smoke passou em `POST /fraud-score` com `200` e JSON valido
 
 Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 
@@ -145,7 +170,7 @@ Importante:
 
 - O `README.md` esta desatualizado em partes.
   - Ele ainda menciona LSH como estrategia principal.
-  - Para o estado atual, confie mais em `src/index.c`, `src/preprocess.c`, `src/common.h` e neste arquivo.
+  - Para o estado atual, confie mais em `src/index.c`, `src/preprocess.c`, `src/quantize.c`, `src/common.h` e neste arquivo.
 
 - O build da imagem depende de rede.
   - [Dockerfile](/Users/viniciusfonseca/projects/rinha-2026/Dockerfile) baixa `references.json.gz` do repositorio oficial durante o build.
@@ -169,10 +194,14 @@ Importante:
 - [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml)
 - [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
 - [src/api.c](/Users/viniciusfonseca/projects/rinha-2026/src/api.c)
+- [src/api_http.c](/Users/viniciusfonseca/projects/rinha-2026/src/api_http.c)
 - [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
 - [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
+- [src/quantize.c](/Users/viniciusfonseca/projects/rinha-2026/src/quantize.c)
+- [src/vectorize.c](/Users/viniciusfonseca/projects/rinha-2026/src/vectorize.c)
+- [src/vector_features.c](/Users/viniciusfonseca/projects/rinha-2026/src/vector_features.c)
 - [test/test.js](/Users/viniciusfonseca/projects/rinha-2026/test/test.js)
 - [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json)
 

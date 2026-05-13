@@ -1,8 +1,8 @@
 #ifndef RINHA_INDEX_H
 #define RINHA_INDEX_H
 
-#include "common.h"
 #include "index_format.h"
+#include "quantize.h"
 
 #include <stdbool.h>
 #include <stddef.h>

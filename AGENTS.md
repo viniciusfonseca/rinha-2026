@@ -19,7 +19,10 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - atende `GET /ready` e `POST /fraud-score`
   - usa `generation` em `user_data` para evitar reaproveitamento incorreto de CQEs
   - drena CQEs em lote e faz flush de SQEs ao final de cada lote
-  - faz parse HTTP, vetorizacao, consulta ao indice e resposta JSON
+  - orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON
+
+- `src/api_http.c`
+  - faz o parse HTTP de rota, `Content-Length`, corpo e `keep-alive`
 
 - `src/lb.c`
   - proxy TCP entre cliente e LB, e unix sockets entre LB e APIs
@@ -27,7 +30,13 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - drena CQEs em lote e faz flush de SQEs ao final de cada lote
 
 - `src/vectorize.c`
-  - converte o payload da Rinha em um vetor de 14 dimensoes
+  - faz o parse JSON especializado do payload da Rinha
+
+- `src/vector_features.c`
+  - converte o payload parseado em um vetor de 14 dimensoes
+
+- `src/vectorize_payload.h`
+  - define o contrato interno entre parser de payload e vetorizacao
 
 - `src/preprocess.c`
   - gera `index.bin` a partir do dataset oficial
@@ -38,7 +47,10 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - poda por raio as listas fora do seed, ordena as sobreviventes por `lower bound`, usa parada antecipada e corta a distancia candidata assim que ela ja nao pode entrar no `top-5`
 
 - `src/common.h`
-  - concentra parametros globais e tipos de quantizacao em 16 bits
+  - concentra dimensao do vetor, parametros globais do indice e `rinha_clamp01`
+
+- `src/quantize.c`
+  - concentra quantizacao/dequantizacao em 16 bits
 
 - `PARAMETROS.md`
   - explica os parâmetros do índice e o impacto de cada um em velocidade e precisão
@@ -138,8 +150,9 @@ Antes de fazer mudancas grandes, leia nesta ordem:
 1. `AGENTS.md`
 2. `MEMORY.md`
 3. `src/common.h`
-4. `src/index_format.h`
-5. `src/index.c`
-6. `src/preprocess.c`
-7. `Makefile`
-8. `docker-compose.yml`
+4. `src/quantize.h`
+5. `src/index_format.h`
+6. `src/index.c`
+7. `src/preprocess.c`
+8. `Makefile`
+9. `docker-compose.yml`
