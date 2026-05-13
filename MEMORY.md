@@ -53,9 +53,9 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
   - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
-    - `RINHA_IVF_NLIST = 512`
+    - `RINHA_IVF_NLIST = 1024`
     - `RINHA_IVF_NPROBE = 4`
-    - `RINHA_IVF_TRAIN_SAMPLES = 65536`
+    - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
 
 - [src/quantize.c](/Users/viniciusfonseca/projects/rinha-2026/src/quantize.c)
@@ -135,6 +135,21 @@ Importante:
 - Rodar smoke manual:
   - `curl -sS -D - -o /dev/null http://localhost:9999/ready`
   - `curl -sS -D - -H "Content-Type: application/json" --data-raw @payload.json http://localhost:9999/fraud-score`
+
+## Telemetria do Indice
+
+- O indice agora aceita profiler opcional por ambiente:
+  - `RINHA_INDEX_PROFILE=1`
+  - `RINHA_INDEX_PROFILE_EVERY=1000`
+- Quando habilitado, cada processo de API escreve em `stderr` um agregado com:
+  - tempo medio por fase da `rinha_index_fraud_count_top5`
+  - listas escaneadas e podadas
+  - vetores escaneados nas probe lists e nas candidate lists
+- O custo quando desligado fica baixo; o caminho padrao continua sem telemetria.
+- Ultima comparacao util com a telemetria:
+  - antes do retuning para `NLIST=1024`, o indice ficava em ~`1.26ms` a `1.34ms` por request, com ~`115315` vetores escaneados por consulta
+  - depois do retuning e do corte no `scan_list`, caiu para ~`0.81ms` a `0.84ms` por request, com ~`106762` vetores escaneados por consulta
+  - o maior custo continua sendo `candidate_scan`, mas caiu de ~`1.01ms`-`1.08ms` para ~`0.67ms`
 
 ## Compose e Ambientes
 

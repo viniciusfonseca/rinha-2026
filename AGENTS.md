@@ -118,6 +118,14 @@ Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linu
 - teste de carga em Mac:
   - `make test-ci-macos`
 
+## Telemetria Opcional
+
+- Para perfilar a busca do indice sem mudar codigo, use:
+  - `RINHA_INDEX_PROFILE=1`
+  - `RINHA_INDEX_PROFILE_EVERY=1000`
+- As APIs passam essas variaveis pelo `docker-compose.yml`.
+- Os logs mostram tempo medio por fase e volume medio de listas e vetores escaneados por request.
+
 ## Armadilhas Conhecidas
 
 - `io_uring` com Docker Desktop no Mac em `linux/amd64` pode falhar via emulacao

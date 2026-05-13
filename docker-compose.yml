@@ -35,6 +35,8 @@ services:
     environment:
       RINHA_INDEX_PATH: /opt/rinha/index.bin
       API_SOCKET_PATH: /run/rinha/api1.sock
+      RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
+      RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
     security_opt:
       - seccomp=unconfined
     deploy:
@@ -57,6 +59,8 @@ services:
     environment:
       RINHA_INDEX_PATH: /opt/rinha/index.bin
       API_SOCKET_PATH: /run/rinha/api2.sock
+      RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
+      RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
     security_opt:
       - seccomp=unconfined
     deploy:

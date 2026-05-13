@@ -1,12 +1,15 @@
 #include "index.h"
 
-#include <math.h>
 #include <float.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -22,6 +25,140 @@ typedef struct {
     float lower_bound_sq;
     uint32_t list;
 } rinha_list_candidate_t;
+
+typedef struct {
+    bool initialized;
+    bool enabled;
+    uint64_t report_every;
+    uint64_t calls;
+    uint64_t total_ns;
+    uint64_t plan_ns;
+    uint64_t probe_scan_ns;
+    uint64_t candidate_build_ns;
+    uint64_t candidate_sort_ns;
+    uint64_t candidate_scan_ns;
+    uint64_t probe_lists_total;
+    uint64_t probe_lists_scanned;
+    uint64_t probe_lists_pruned_bound;
+    uint64_t candidate_lists_considered;
+    uint64_t candidate_lists_selected;
+    uint64_t candidate_lists_scanned;
+    uint64_t candidate_lists_pruned_radius;
+    uint64_t candidate_lists_pruned_bound;
+    uint64_t candidate_lists_skipped_after_sort;
+    uint64_t vectors_scanned_probe;
+    uint64_t vectors_scanned_candidate;
+} rinha_index_profile_t;
+
+static rinha_index_profile_t rinha_index_profile = {0};
+
+static bool rinha_env_truthy(const char *value) {
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+    if (strcmp(value, "0") == 0 ||
+        strcmp(value, "false") == 0 ||
+        strcmp(value, "False") == 0 ||
+        strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "no") == 0 ||
+        strcmp(value, "No") == 0 ||
+        strcmp(value, "NO") == 0 ||
+        strcmp(value, "off") == 0 ||
+        strcmp(value, "Off") == 0 ||
+        strcmp(value, "OFF") == 0) {
+        return false;
+    }
+    return true;
+}
+
+static uint64_t rinha_env_u64(const char *name, uint64_t fallback) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0ull) {
+        return fallback;
+    }
+    return (uint64_t) parsed;
+}
+
+static uint64_t rinha_now_ns(void) {
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static void rinha_index_profile_report(const char *reason) {
+    if (!rinha_index_profile.enabled || rinha_index_profile.calls == 0u) {
+        return;
+    }
+
+    double calls = (double) rinha_index_profile.calls;
+    double avg_total_us = (double) rinha_index_profile.total_ns / calls / 1000.0;
+    double avg_plan_us = (double) rinha_index_profile.plan_ns / calls / 1000.0;
+    double avg_probe_scan_us = (double) rinha_index_profile.probe_scan_ns / calls / 1000.0;
+    double avg_candidate_build_us = (double) rinha_index_profile.candidate_build_ns / calls / 1000.0;
+    double avg_candidate_sort_us = (double) rinha_index_profile.candidate_sort_ns / calls / 1000.0;
+    double avg_candidate_scan_us = (double) rinha_index_profile.candidate_scan_ns / calls / 1000.0;
+    double avg_vectors_probe = (double) rinha_index_profile.vectors_scanned_probe / calls;
+    double avg_vectors_candidate = (double) rinha_index_profile.vectors_scanned_candidate / calls;
+
+    fprintf(
+        stderr,
+        "[index-prof] reason=%s calls=%" PRIu64
+        " avg_total_us=%.2f avg_plan_us=%.2f avg_probe_scan_us=%.2f"
+        " avg_candidate_build_us=%.2f avg_candidate_sort_us=%.2f avg_candidate_scan_us=%.2f"
+        " avg_probe_lists=%.2f avg_probe_scanned=%.2f avg_probe_pruned_bound=%.2f"
+        " avg_candidate_considered=%.2f avg_candidate_selected=%.2f avg_candidate_scanned=%.2f"
+        " avg_candidate_pruned_radius=%.2f avg_candidate_pruned_bound=%.2f avg_candidate_skipped_after_sort=%.2f"
+        " avg_vectors_probe=%.2f avg_vectors_candidate=%.2f avg_vectors_total=%.2f\n",
+        reason,
+        rinha_index_profile.calls,
+        avg_total_us,
+        avg_plan_us,
+        avg_probe_scan_us,
+        avg_candidate_build_us,
+        avg_candidate_sort_us,
+        avg_candidate_scan_us,
+        (double) rinha_index_profile.probe_lists_total / calls,
+        (double) rinha_index_profile.probe_lists_scanned / calls,
+        (double) rinha_index_profile.probe_lists_pruned_bound / calls,
+        (double) rinha_index_profile.candidate_lists_considered / calls,
+        (double) rinha_index_profile.candidate_lists_selected / calls,
+        (double) rinha_index_profile.candidate_lists_scanned / calls,
+        (double) rinha_index_profile.candidate_lists_pruned_radius / calls,
+        (double) rinha_index_profile.candidate_lists_pruned_bound / calls,
+        (double) rinha_index_profile.candidate_lists_skipped_after_sort / calls,
+        avg_vectors_probe,
+        avg_vectors_candidate,
+        avg_vectors_probe + avg_vectors_candidate
+    );
+}
+
+static void rinha_index_profile_flush(void) {
+    rinha_index_profile_report("exit");
+}
+
+static void rinha_index_profile_init(void) {
+    if (rinha_index_profile.initialized) {
+        return;
+    }
+
+    rinha_index_profile.initialized = true;
+    rinha_index_profile.enabled = rinha_env_truthy(getenv("RINHA_INDEX_PROFILE"));
+    rinha_index_profile.report_every = rinha_env_u64("RINHA_INDEX_PROFILE_EVERY", 1000u);
+
+    if (rinha_index_profile.enabled) {
+        atexit(rinha_index_profile_flush);
+    }
+}
 
 static float rinha_distance_sq_scalar(
     const float query[RINHA_DIM],
@@ -239,6 +376,7 @@ static void rinha_insert_top5(
 
 bool rinha_index_open(rinha_index_t *index, const char *path) {
     memset(index, 0, sizeof(*index));
+    rinha_index_profile_init();
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -352,7 +490,7 @@ static size_t rinha_plan_probe_lists(
     return probe_count;
 }
 
-static void rinha_scan_list(
+static uint32_t rinha_scan_list(
     const rinha_index_t *index,
     const float query[RINHA_DIM],
     const float *decode,
@@ -363,23 +501,55 @@ static void rinha_scan_list(
     uint32_t start = index->list_offsets[list];
     uint32_t end = index->list_offsets[list + 1u];
     if (start >= end) {
-        return;
+        return 0u;
     }
 
+    const rinha_vector_scalar_t *vectors = index->vectors;
+    const uint8_t *labels = index->labels;
     for (uint32_t item = start; item < end; item++) {
-        const rinha_vector_scalar_t *vector = index->vectors + (size_t) item * RINHA_DIM;
+        const rinha_vector_scalar_t *vector = vectors + (size_t) item * RINHA_DIM;
         float exact_distance = rinha_distance_sq(query, vector, decode, best_dist[4]);
-        rinha_insert_top5(best_dist, best_label, exact_distance, index->labels[item]);
+        if (exact_distance < best_dist[4]) {
+            rinha_insert_top5(best_dist, best_label, exact_distance, labels[item]);
+        }
     }
+    return end - start;
 }
 
 int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_DIM]) {
+    bool profile_enabled = rinha_index_profile.enabled;
+    uint64_t total_start_ns = profile_enabled ? rinha_now_ns() : 0u;
+    uint64_t phase_start_ns = 0u;
+    uint64_t plan_ns = 0u;
+    uint64_t probe_scan_ns = 0u;
+    uint64_t candidate_build_ns = 0u;
+    uint64_t candidate_sort_ns = 0u;
+    uint64_t candidate_scan_ns = 0u;
+    uint64_t probe_lists_scanned = 0u;
+    uint64_t probe_lists_pruned_bound = 0u;
+    uint64_t candidate_lists_considered = 0u;
+    uint64_t candidate_lists_selected = 0u;
+    uint64_t candidate_lists_scanned = 0u;
+    uint64_t candidate_lists_pruned_radius = 0u;
+    uint64_t candidate_lists_pruned_bound = 0u;
+    uint64_t candidate_lists_skipped_after_sort = 0u;
+    uint64_t vectors_scanned_probe = 0u;
+    uint64_t vectors_scanned_candidate = 0u;
+
     const float *decode = rinha_dequantize_lut();
     float centroid_dist_sq[RINHA_IVF_NLIST];
     rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE];
     rinha_list_candidate_t candidate_lists[RINHA_IVF_NLIST - RINHA_IVF_NPROBE];
     bool selected_lists[RINHA_IVF_NLIST] = {false};
+
+    if (profile_enabled) {
+        phase_start_ns = rinha_now_ns();
+    }
     size_t probe_count = rinha_plan_probe_lists(index, query, centroid_dist_sq, probe_lists);
+    if (profile_enabled) {
+        plan_ns = rinha_now_ns() - phase_start_ns;
+        phase_start_ns = rinha_now_ns();
+    }
 
     float best_dist[5] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
     uint8_t best_label[5] = {0u, 0u, 0u, 0u, 0u};
@@ -389,9 +559,15 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         selected_lists[list] = true;
         float lower_bound_sq = rinha_list_lower_bound_sq(probe_lists[i].centroid_dist_sq, index->list_radii[list]);
         if (lower_bound_sq >= best_dist[4]) {
+            probe_lists_pruned_bound++;
             continue;
         }
-        rinha_scan_list(index, query, decode, list, best_dist, best_label);
+        probe_lists_scanned++;
+        vectors_scanned_probe += rinha_scan_list(index, query, decode, list, best_dist, best_label);
+    }
+    if (profile_enabled) {
+        probe_scan_ns = rinha_now_ns() - phase_start_ns;
+        phase_start_ns = rinha_now_ns();
     }
 
     size_t candidate_count = 0u;
@@ -400,33 +576,76 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         if (selected_lists[list]) {
             continue;
         }
+        candidate_lists_considered++;
         if (prune_distance < FLT_MAX) {
             float max_centroid_dist = prune_distance + index->list_radii[list];
             if (centroid_dist_sq[list] >= max_centroid_dist * max_centroid_dist) {
+                candidate_lists_pruned_radius++;
                 continue;
             }
         }
         float lower_bound_sq = rinha_list_lower_bound_sq(centroid_dist_sq[list], index->list_radii[list]);
         if (lower_bound_sq >= best_dist[4]) {
+            candidate_lists_pruned_bound++;
             continue;
         }
         rinha_insert_candidate_list(&candidate_lists[candidate_count++], lower_bound_sq, list);
+        candidate_lists_selected++;
+    }
+    if (profile_enabled) {
+        candidate_build_ns = rinha_now_ns() - phase_start_ns;
+        phase_start_ns = rinha_now_ns();
     }
 
     if (candidate_count > 1u) {
         qsort(candidate_lists, candidate_count, sizeof(candidate_lists[0]), rinha_compare_candidate_lists);
     }
+    if (profile_enabled) {
+        candidate_sort_ns = rinha_now_ns() - phase_start_ns;
+        phase_start_ns = rinha_now_ns();
+    }
 
     for (size_t i = 0; i < candidate_count; i++) {
         if (candidate_lists[i].lower_bound_sq >= best_dist[4]) {
+            candidate_lists_skipped_after_sort += candidate_count - i;
             break;
         }
-        rinha_scan_list(index, query, decode, candidate_lists[i].list, best_dist, best_label);
+        candidate_lists_scanned++;
+        vectors_scanned_candidate += rinha_scan_list(index, query, decode, candidate_lists[i].list, best_dist, best_label);
+    }
+    if (profile_enabled) {
+        candidate_scan_ns = rinha_now_ns() - phase_start_ns;
     }
 
     int fraud_count = 0;
     for (size_t i = 0; i < 5; i++) {
         fraud_count += best_label[i] ? 1 : 0;
+    }
+
+    if (profile_enabled) {
+        rinha_index_profile.calls++;
+        rinha_index_profile.total_ns += rinha_now_ns() - total_start_ns;
+        rinha_index_profile.plan_ns += plan_ns;
+        rinha_index_profile.probe_scan_ns += probe_scan_ns;
+        rinha_index_profile.candidate_build_ns += candidate_build_ns;
+        rinha_index_profile.candidate_sort_ns += candidate_sort_ns;
+        rinha_index_profile.candidate_scan_ns += candidate_scan_ns;
+        rinha_index_profile.probe_lists_total += probe_count;
+        rinha_index_profile.probe_lists_scanned += probe_lists_scanned;
+        rinha_index_profile.probe_lists_pruned_bound += probe_lists_pruned_bound;
+        rinha_index_profile.candidate_lists_considered += candidate_lists_considered;
+        rinha_index_profile.candidate_lists_selected += candidate_lists_selected;
+        rinha_index_profile.candidate_lists_scanned += candidate_lists_scanned;
+        rinha_index_profile.candidate_lists_pruned_radius += candidate_lists_pruned_radius;
+        rinha_index_profile.candidate_lists_pruned_bound += candidate_lists_pruned_bound;
+        rinha_index_profile.candidate_lists_skipped_after_sort += candidate_lists_skipped_after_sort;
+        rinha_index_profile.vectors_scanned_probe += vectors_scanned_probe;
+        rinha_index_profile.vectors_scanned_candidate += vectors_scanned_candidate;
+
+        if (rinha_index_profile.report_every > 0u &&
+            rinha_index_profile.calls % rinha_index_profile.report_every == 0u) {
+            rinha_index_profile_report("periodic");
+        }
     }
     return fraud_count;
 }

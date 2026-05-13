@@ -4,7 +4,7 @@ Este arquivo resume os parâmetros principais do índice IVF e da quantização 
 
 ## IVF
 
-### `RINHA_IVF_NLIST = 512`
+### `RINHA_IVF_NLIST = 1024`
 
 Quantidade de listas invertidas do índice.
 
@@ -23,7 +23,7 @@ Quantidade de listas que a consulta realmente examina.
 
 Esse é o principal botão de troca entre velocidade e qualidade em runtime.
 
-### `RINHA_IVF_TRAIN_SAMPLES = 65536`
+### `RINHA_IVF_TRAIN_SAMPLES = 131072`
 
 Quantidade de amostras usada para treinar os centróides do IVF.
 
