@@ -1,10 +1,7 @@
 x-api: &api
-  image: rinha-2026-local
+  image: distanteagle16/rinha-2026
   platform: linux/amd64
   command: ["/usr/local/bin/fraud_api"]
-  build:
-    context: .
-    dockerfile: Dockerfile
   environment:
     RINHA_INDEX_PATH: /opt/rinha/index.bin
     API_SOCKET_PATH: /run/rinha/api.sock
@@ -18,8 +15,6 @@ x-api: &api
       limits:
         cpus: "0.45"
         memory: "150MB"
-        # cpus: "0.30"
-        # memory: "100MB"
   volumes:
     - rinha-sockets:/run/rinha
   networks:
@@ -27,21 +22,16 @@ x-api: &api
 
 services:
   lb:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rinha-2026-local
+    image: distanteagle16/rinha-2026
     platform: linux/amd64
     command: ["/usr/local/bin/fraud_lb"]
     environment:
       BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
-      # BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock,unix:/run/rinha/api3.sock
     ports:
       - "9999:9999"
     depends_on:
       - api1
       - api2
-      # - api3
     security_opt:
       - seccomp=unconfined
     deploy:
@@ -72,13 +62,6 @@ services:
       RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
       RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
     cpuset: "2,3"
-  # api3:
-  #   <<: *api
-  #   environment:
-  #     RINHA_INDEX_PATH: /opt/rinha/index.bin
-  #     API_SOCKET_PATH: /run/rinha/api3.sock
-  #     RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
-  #     RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
 
 volumes:
   rinha-sockets:
