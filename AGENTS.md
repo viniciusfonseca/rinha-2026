@@ -35,6 +35,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 - `src/index.c`
   - abre e consulta o indice vetorial serializado
   - usa SIMD AVX2 no hot path de distancia quando a arquitetura suporta
+  - expande listas fora do seed em ordem de `lower bound`, com parada antecipada
 
 - `src/common.h`
   - concentra parametros globais e tipos de quantizacao em 16 bits
@@ -50,11 +51,11 @@ O estado atual e:
 
 - indice IVF serializado em `index.bin`
 - consulta com aquecimento das `nprobe` listas de centroides mais proximos
-- expansao exata so para listas que ainda podem melhorar o `top-5`
+- expansao exata em ordem de `lower bound` so para listas que ainda podem melhorar o `top-5`
 - varredura exata dentro das listas com poda por raio
 - arquivo serializado sem payload morto de `PQ`
 - vetores armazenados em `uint16_t` para reduzir memoria e manter boa fidelidade
-- em x86, o caminho de distancia usa SIMD AVX2; em outras arquiteturas existe fallback scalar
+- em x86, o caminho de distancia usa SIMD AVX2 com dequantizacao direta em registrador; em outras arquiteturas existe fallback scalar
 
 Se encontrar documentacao antiga mencionando LSH como estrategia principal, trate como desatualizada e confirme no codigo atual.
 

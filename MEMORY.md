@@ -36,8 +36,8 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
   - Consulta o `index.bin`.
-  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos e depois expandir apenas para listas que ainda podem bater o pior `top-5`, com poda por raio.
-  - O loop quente de distancia usa LUT de dequantizacao para evitar branch e multiplicacao por dimensao no hot path.
+  - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos e depois expandir as listas restantes em ordem de `lower bound`, parando cedo quando o `top-5` ja esta matematicamente fechado.
+  - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, para reduzir custo de CPU/cache no runtime.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
 
@@ -141,7 +141,7 @@ Importante:
   - O compose monta um volume compartilhado em `/run/rinha`.
 
 - A API ja caiu em timeouts quando a busca degenerava para custo alto por request.
-  - Hoje a busca esta mais previsivel com listas ordenadas por lower bound e poda por raio.
+  - Hoje a busca esta mais previsivel com listas ordenadas por lower bound, parada antecipada e poda por raio.
 
 - O `README.md` esta desatualizado em partes.
   - Ele ainda menciona LSH como estrategia principal.

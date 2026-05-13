@@ -17,6 +17,11 @@ typedef struct {
     uint32_t list;
 } rinha_list_bound_t;
 
+typedef struct {
+    float lower_bound_sq;
+    uint32_t list;
+} rinha_list_candidate_t;
+
 static float rinha_distance_sq_scalar(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
     float diff0 = query[0] - decode[vector[0]];
     float diff1 = query[1] - decode[vector[1]];
@@ -84,35 +89,46 @@ static float rinha_reduce_m128(__m128 value) {
 }
 
 __attribute__((target("avx2")))
+static __m256 rinha_decode8_avx2(const rinha_vector_scalar_t *vector) {
+    const __m256 scale = _mm256_set1_ps(1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
+    const __m256 missing_value = _mm256_set1_ps(-1.0f);
+    const __m256i missing = _mm256_set1_epi32((int) RINHA_VECTOR_QUANT_MISSING);
+
+    __m128i packed = _mm_loadu_si128((const __m128i *) vector);
+    __m256i values_i32 = _mm256_cvtepu16_epi32(packed);
+    __m256 values = _mm256_mul_ps(_mm256_cvtepi32_ps(values_i32), scale);
+    __m256 mask = _mm256_castsi256_ps(_mm256_cmpeq_epi32(values_i32, missing));
+    return _mm256_blendv_ps(values, missing_value, mask);
+}
+
+__attribute__((target("avx2")))
+static __m128 rinha_decode4_avx2(const rinha_vector_scalar_t *vector) {
+    const __m128 scale = _mm_set1_ps(1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
+    const __m128 missing_value = _mm_set1_ps(-1.0f);
+    const __m128i missing = _mm_set1_epi32((int) RINHA_VECTOR_QUANT_MISSING);
+
+    __m128i packed = _mm_loadl_epi64((const __m128i *) vector);
+    __m128i values_i32 = _mm_cvtepu16_epi32(packed);
+    __m128 values = _mm_mul_ps(_mm_cvtepi32_ps(values_i32), scale);
+    __m128 mask = _mm_castsi128_ps(_mm_cmpeq_epi32(values_i32, missing));
+    return _mm_blendv_ps(values, missing_value, mask);
+}
+
+__attribute__((target("avx2")))
 static float rinha_distance_sq_avx2(const float query[RINHA_DIM], const rinha_vector_scalar_t *vector, const float *decode) {
+    (void) decode;
     __m256 query0 = _mm256_loadu_ps(query);
-    __m256i indices0 = _mm256_setr_epi32(
-        (int) vector[0],
-        (int) vector[1],
-        (int) vector[2],
-        (int) vector[3],
-        (int) vector[4],
-        (int) vector[5],
-        (int) vector[6],
-        (int) vector[7]
-    );
-    __m256 values0 = _mm256_i32gather_ps(decode, indices0, 4);
+    __m256 values0 = rinha_decode8_avx2(vector);
     __m256 diff0 = _mm256_sub_ps(query0, values0);
     __m256 sum0 = _mm256_mul_ps(diff0, diff0);
 
     __m128 query1 = _mm_loadu_ps(query + 8);
-    __m128i indices1 = _mm_setr_epi32(
-        (int) vector[8],
-        (int) vector[9],
-        (int) vector[10],
-        (int) vector[11]
-    );
-    __m128 values1 = _mm_i32gather_ps(decode, indices1, 4);
+    __m128 values1 = rinha_decode4_avx2(vector + 8);
     __m128 diff1 = _mm_sub_ps(query1, values1);
     __m128 sum1 = _mm_mul_ps(diff1, diff1);
 
-    float diff12 = query[12] - decode[vector[12]];
-    float diff13 = query[13] - decode[vector[13]];
+    float diff12 = query[12] - rinha_dequantize_scalar(vector[12]);
+    float diff13 = query[13] - rinha_dequantize_scalar(vector[13]);
     return rinha_reduce_m256(sum0) + rinha_reduce_m128(sum1) + diff12 * diff12 + diff13 * diff13;
 }
 
@@ -228,6 +244,30 @@ static void rinha_insert_probe_list(rinha_list_bound_t bounds[RINHA_IVF_NPROBE],
     bounds[slot].list = list;
 }
 
+static void rinha_insert_candidate_list(
+    rinha_list_candidate_t *candidates,
+    size_t count,
+    float lower_bound_sq,
+    uint32_t list
+) {
+    size_t slot = count;
+    while (slot > 0u && lower_bound_sq < candidates[slot - 1u].lower_bound_sq) {
+        candidates[slot] = candidates[slot - 1u];
+        slot--;
+    }
+    candidates[slot].lower_bound_sq = lower_bound_sq;
+    candidates[slot].list = list;
+}
+
+static float rinha_list_lower_bound_sq(float centroid_dist_sq, float radius) {
+    float centroid_dist = sqrtf(centroid_dist_sq);
+    if (centroid_dist <= radius) {
+        return 0.0f;
+    }
+    float lower_bound = centroid_dist - radius;
+    return lower_bound * lower_bound;
+}
+
 static size_t rinha_plan_probe_lists(
     const rinha_index_t *index,
     const float query[RINHA_DIM],
@@ -278,48 +318,40 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     const float *decode = rinha_dequantize_lut();
     float centroid_dist_sq[RINHA_IVF_NLIST];
     rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE];
+    rinha_list_candidate_t candidate_lists[RINHA_IVF_NLIST - RINHA_IVF_NPROBE];
     bool selected_lists[RINHA_IVF_NLIST] = {false};
     size_t probe_count = rinha_plan_probe_lists(index, query, centroid_dist_sq, probe_lists);
 
     float best_dist[5] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX};
     uint8_t best_label[5] = {0u, 0u, 0u, 0u, 0u};
-    float prune_distance = FLT_MAX;
 
     for (size_t i = 0; i < probe_count; i++) {
         uint32_t list = probe_lists[i].list;
         selected_lists[list] = true;
-
-        if (prune_distance < FLT_MAX) {
-            float max_centroid_dist = prune_distance + index->list_radii[list];
-            if (probe_lists[i].centroid_dist_sq >= max_centroid_dist * max_centroid_dist) {
-                continue;
-            }
+        float lower_bound_sq = rinha_list_lower_bound_sq(probe_lists[i].centroid_dist_sq, index->list_radii[list]);
+        if (lower_bound_sq >= best_dist[4]) {
+            continue;
         }
-
-        float previous_worst = best_dist[4];
         rinha_scan_list(index, query, decode, list, best_dist, best_label);
-        if (best_dist[4] < previous_worst) {
-            prune_distance = sqrtf(best_dist[4]);
-        }
     }
 
+    size_t candidate_count = 0u;
     for (uint32_t list = 0; list < index->nlist; list++) {
         if (selected_lists[list]) {
             continue;
         }
-
-        if (prune_distance < FLT_MAX) {
-            float max_centroid_dist = prune_distance + index->list_radii[list];
-            if (centroid_dist_sq[list] >= max_centroid_dist * max_centroid_dist) {
-                continue;
-            }
+        float lower_bound_sq = rinha_list_lower_bound_sq(centroid_dist_sq[list], index->list_radii[list]);
+        if (lower_bound_sq >= best_dist[4]) {
+            continue;
         }
+        rinha_insert_candidate_list(candidate_lists, candidate_count++, lower_bound_sq, list);
+    }
 
-        float previous_worst = best_dist[4];
-        rinha_scan_list(index, query, decode, list, best_dist, best_label);
-        if (best_dist[4] < previous_worst) {
-            prune_distance = sqrtf(best_dist[4]);
+    for (size_t i = 0; i < candidate_count; i++) {
+        if (candidate_lists[i].lower_bound_sq >= best_dist[4]) {
+            break;
         }
+        rinha_scan_list(index, query, decode, candidate_lists[i].list, best_dist, best_label);
     }
 
     int fraud_count = 0;
