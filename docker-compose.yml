@@ -7,12 +7,13 @@ services:
     platform: linux/amd64
     command: ["/usr/local/bin/fraud_lb"]
     environment:
-      BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
+      BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock,unix:/run/rinha/api3.sock
     ports:
       - "9999:9999"
     depends_on:
       - api1
       - api2
+      - api3
     security_opt:
       - seccomp=unconfined
     deploy:
@@ -42,7 +43,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.30"
           memory: "151MB"
     volumes:
       - rinha-sockets:/run/rinha
@@ -66,7 +67,31 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.30"
+          memory: "151MB"
+    volumes:
+      - rinha-sockets:/run/rinha
+    networks:
+      - rinha
+
+  api3:
+    image: rinha-2026-local
+    platform: linux/amd64
+    command: ["/usr/local/bin/fraud_api"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      RINHA_INDEX_PATH: /opt/rinha/index.bin
+      API_SOCKET_PATH: /run/rinha/api3.sock
+      RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
+      RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
           memory: "151MB"
     volumes:
       - rinha-sockets:/run/rinha
