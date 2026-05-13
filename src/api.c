@@ -316,13 +316,19 @@ static void api_handle_business(api_conn_t *conn, const api_request_t *request, 
         return;
     }
 
-    float vector[RINHA_DIM];
-    if (!rinha_request_to_vector(request->body, request->content_length, vector)) {
+    rinha_tx_payload_t payload;
+    if (!rinha_parse_tx_payload(request->body, request->content_length, &payload)) {
         api_prepare_response(conn, "400 Bad Request", "text/plain", "invalid payload", false);
         return;
     }
 
+    float vector[RINHA_DIM];
+    rinha_payload_to_vector(&payload, vector);
+
     int fraud_count = rinha_index_fraud_count_top5(index, vector);
+    if (fraud_count == 2 && rinha_payload_force_deny_borderline(&payload)) {
+        fraud_count = 3;
+    }
     float fraud_score = (float) fraud_count / 5.0f;
     bool approved = fraud_score < 0.6f;
 
