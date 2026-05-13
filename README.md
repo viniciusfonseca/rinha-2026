@@ -17,7 +17,7 @@ Implementação em C com:
 
 O dataset oficial é transformado, no build, em:
 
-- vetores quantizados em `8 bits` de 14 dimensões
+- vetores quantizados em `16 bits` de 14 dimensões
 - labels binários
 - um índice IVF para reduzir o conjunto de candidatos por consulta
 
@@ -27,6 +27,8 @@ Na consulta:
 2. a busca usa IVF para selecionar listas candidatas
 3. a distância euclidiana é calculada apenas nos vetores dessas listas
 4. os 5 vizinhos mais próximos determinam `fraud_score`
+
+Se quiser entender o efeito de cada parâmetro do índice, veja [PARAMETROS.md](PARAMETROS.md).
 
 ## Como rodar
 

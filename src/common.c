@@ -6,7 +6,7 @@
 
 const float *rinha_dequantize_lut(void) {
     static bool initialized = false;
-    static float table[1u << 8];
+    static float table[1u << 16];
     if (!initialized) {
         for (size_t i = 0; i < RINHA_VECTOR_QUANT_MISSING; i++) {
             table[i] = (float) i * (1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
