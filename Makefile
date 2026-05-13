@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O3 -std=c11 -Wall -Wextra -Wpedantic -D_GNU_SOURCE
+CFLAGS ?= -O3 -std=c11 -mavx2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE
 LDFLAGS ?=
 
 BIN_DIR := bin
