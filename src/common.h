@@ -20,10 +20,10 @@
 #define RINHA_IVF_NPROBE 16u
 #define RINHA_IVF_TRAIN_SAMPLES 32768u
 #define RINHA_IVF_KMEANS_ITERS 12u
-#define RINHA_VECTOR_QUANT_SCALE 65534u
-#define RINHA_VECTOR_QUANT_MISSING 65535u
+#define RINHA_VECTOR_QUANT_SCALE 254u
+#define RINHA_VECTOR_QUANT_MISSING 255u
 
-typedef uint16_t rinha_vector_scalar_t;
+typedef uint8_t rinha_vector_scalar_t;
 
 typedef struct {
     uint8_t bit_positions[RINHA_TABLE_COUNT][RINHA_BUCKET_BITS];

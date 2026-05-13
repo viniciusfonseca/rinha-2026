@@ -37,7 +37,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - usa SIMD AVX2 no hot path de distancia quando a arquitetura suporta
 
 - `src/common.h`
-  - concentra parametros globais e tipos de quantizacao
+  - concentra parametros globais e tipos de quantizacao em 8 bits
 
 ## Estado Atual da Busca
 
@@ -50,7 +50,7 @@ O estado atual e:
 - expansao exata so para listas que ainda podem melhorar o `top-5`
 - varredura exata dentro das listas com poda por raio
 - arquivo serializado sem payload morto de `PQ`
-- vetores armazenados em 16 bits para reduzir erro de representacao
+- vetores armazenados em `uint8_t` para reduzir memoria e manter boa fidelidade
 - em x86, o caminho de distancia usa SIMD AVX2; em outras arquiteturas existe fallback scalar
 
 Se encontrar documentacao antiga mencionando LSH como estrategia principal, trate como desatualizada e confirme no codigo atual.

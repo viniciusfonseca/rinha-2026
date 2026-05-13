@@ -32,7 +32,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
   - Baixa o dataset oficial no build da imagem e gera `index.bin`.
-  - Hoje gera estrutura IVF enxuta com centroides, offsets por lista, raios por lista, labels e vetores quantizados.
+  - Hoje gera estrutura IVF enxuta com centroides, offsets por lista, raios por lista, labels e vetores quantizados em `8 bits`.
 
 - [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
   - Consulta o `index.bin`.
@@ -42,23 +42,23 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
 
 - [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
-  - Parametros globais do indice e quantizacao.
+  - Parametros globais do indice e quantizacao em 8 bits.
   - Estado atual importante:
     - `RINHA_IVF_NLIST = 512`
     - `RINHA_IVF_NPROBE = 16`
     - `RINHA_IVF_TRAIN_SAMPLES = 32768`
     - `RINHA_IVF_KMEANS_ITERS = 12`
-    - vetores armazenados em `uint16_t` via `rinha_vector_scalar_t`
+    - vetores armazenados em `uint8_t` via `rinha_vector_scalar_t`
 
 ## Formato do Indice
 
 - Arquivo: [src/index_format.h](/Users/viniciusfonseca/projects/rinha-2026/src/index_format.h)
 - Versao atual:
-  - `RINHA_INDEX_MAGIC = "R26IVF5"`
-  - `RINHA_INDEX_VERSION = 5`
+  - `RINHA_INDEX_MAGIC = "R26IVF7"`
+  - `RINHA_INDEX_VERSION = 7`
 - Mudancas mais recentes:
   - inclusao de `list_radii`
-  - armazenamento de vetores em 16 bits
+  - armazenamento de vetores quantizados em 8 bits
   - remocao do payload morto de `PQ` do arquivo serializado
 
 Sempre que mudar o formato serializado, atualizar esse header e regenerar `index.bin`.

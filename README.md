@@ -17,15 +17,15 @@ Implementação em C com:
 
 O dataset oficial é transformado, no build, em:
 
-- vetores quantizados de 14 dimensões
+- vetores quantizados em `8 bits` de 14 dimensões
 - labels binários
-- quatro tabelas LSH para reduzir o conjunto de candidatos por consulta
+- um índice IVF para reduzir o conjunto de candidatos por consulta
 
 Na consulta:
 
 1. o payload é vetorizado conforme `REGRAS_DE_DETECCAO.md`
-2. a busca usa LSH para coletar candidatos
-3. a distância euclidiana é calculada apenas nesses candidatos
+2. a busca usa IVF para selecionar listas candidatas
+3. a distância euclidiana é calculada apenas nos vetores dessas listas
 4. os 5 vizinhos mais próximos determinam `fraud_score`
 
 ## Como rodar
