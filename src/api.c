@@ -25,6 +25,25 @@
 #define API_WRITE_BUFFER 1024
 #define API_CQE_BATCH 64
 #define API_SOCKET_PATH_DEFAULT "/run/rinha/api.sock"
+#define API_SEND_FLAGS MSG_NOSIGNAL
+
+#if defined(IORING_OP_SEND_ZC) && defined(SO_ZEROCOPY)
+#define API_HAVE_SEND_ZC 1
+#else
+#define API_HAVE_SEND_ZC 0
+#endif
+
+#ifndef IORING_CQE_F_MORE
+#define IORING_CQE_F_MORE 0u
+#endif
+
+#ifndef IORING_CQE_F_NOTIF
+#define IORING_CQE_F_NOTIF 0u
+#endif
+
+#ifndef IORING_SEND_ZC_REPORT_USAGE
+#define IORING_SEND_ZC_REPORT_USAGE 0u
+#endif
 
 typedef enum {
     API_OP_ACCEPT = 1,
@@ -41,7 +60,13 @@ typedef struct {
     int fd;
     bool used;
     bool keep_alive;
+    bool zerocopy_enabled;
+    bool send_inflight_zerocopy;
+    bool send_complete_waiting_notif;
+    bool close_pending;
     uint32_t generation;
+    unsigned inflight_ops;
+    unsigned pending_send_notifs;
     size_t read_len;
     size_t write_len;
     size_t write_sent;
@@ -52,6 +77,7 @@ typedef struct {
 typedef struct {
     uint64_t user_data;
     int res;
+    unsigned flags;
 } api_cqe_record_t;
 
 static volatile sig_atomic_t api_running = 1;
@@ -121,7 +147,17 @@ static int api_open_listener(const char *socket_path) {
     return fd;
 }
 
-static void api_close_conn(api_conn_t *conn, int conn_index, int *free_slots, size_t *free_count) {
+static bool api_try_enable_zerocopy(int fd) {
+#if API_HAVE_SEND_ZC
+    int one = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one)) == 0;
+#else
+    (void) fd;
+    return false;
+#endif
+}
+
+static void api_finalize_conn(api_conn_t *conn, int conn_index, int *free_slots, size_t *free_count) {
     bool was_used = conn->used;
     if (conn->fd >= 0) {
         close(conn->fd);
@@ -130,6 +166,12 @@ static void api_close_conn(api_conn_t *conn, int conn_index, int *free_slots, si
     conn->fd = -1;
     conn->used = false;
     conn->keep_alive = false;
+    conn->zerocopy_enabled = false;
+    conn->send_inflight_zerocopy = false;
+    conn->send_complete_waiting_notif = false;
+    conn->close_pending = false;
+    conn->inflight_ops = 0u;
+    conn->pending_send_notifs = 0u;
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
@@ -150,11 +192,37 @@ static int api_alloc_conn(api_conn_t *connections, int *free_slots, size_t *free
     conn->used = true;
     conn->fd = -1;
     conn->keep_alive = false;
+    conn->zerocopy_enabled = false;
+    conn->send_inflight_zerocopy = false;
+    conn->send_complete_waiting_notif = false;
+    conn->close_pending = false;
     conn->generation = next_generation == 0u ? 1u : next_generation;
+    conn->inflight_ops = 0u;
+    conn->pending_send_notifs = 0u;
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
     return i;
+}
+
+static void api_request_close(api_conn_t *conn) {
+    if (conn->fd >= 0) {
+        close(conn->fd);
+        conn->fd = -1;
+    }
+    conn->keep_alive = false;
+    conn->close_pending = true;
+}
+
+static void api_maybe_finalize_conn(
+    api_conn_t *conn,
+    int conn_index,
+    int *free_slots,
+    size_t *free_count
+) {
+    if (conn->close_pending && conn->inflight_ops == 0u && conn->pending_send_notifs == 0u) {
+        api_finalize_conn(conn, conn_index, free_slots, free_count);
+    }
 }
 
 static int api_queue_accept(struct io_uring *ring, int listen_fd, api_accept_state_t *state) {
@@ -175,6 +243,7 @@ static int api_queue_recv(struct io_uring *ring, api_conn_t *conn, int conn_inde
     }
     io_uring_prep_recv(sqe, conn->fd, conn->read_buf + conn->read_len, API_READ_BUFFER - conn->read_len, 0);
     io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_RECV, conn_index, conn->generation));
+    conn->inflight_ops++;
     return 0;
 }
 
@@ -183,14 +252,20 @@ static int api_queue_send(struct io_uring *ring, api_conn_t *conn, int conn_inde
     if (sqe == NULL) {
         return -1;
     }
-    io_uring_prep_send(
-        sqe,
-        conn->fd,
-        conn->write_buf + conn->write_sent,
-        conn->write_len - conn->write_sent,
-        0
-    );
+    const void *buf = conn->write_buf + conn->write_sent;
+    size_t len = conn->write_len - conn->write_sent;
+#if API_HAVE_SEND_ZC
+    if (conn->zerocopy_enabled) {
+        io_uring_prep_send_zc(sqe, conn->fd, buf, len, API_SEND_FLAGS, IORING_SEND_ZC_REPORT_USAGE);
+        conn->send_inflight_zerocopy = true;
+    } else
+#endif
+    {
+        io_uring_prep_send(sqe, conn->fd, buf, len, API_SEND_FLAGS);
+        conn->send_inflight_zerocopy = false;
+    }
     io_uring_sqe_set_data64(sqe, api_pack_user_data(API_OP_SEND, conn_index, conn->generation));
+    conn->inflight_ops++;
     return 0;
 }
 
@@ -216,6 +291,7 @@ static ssize_t api_collect_cqes(struct io_uring *ring, api_cqe_record_t *cqes, s
     cqes[count++] = (api_cqe_record_t) {
         .user_data = io_uring_cqe_get_data64(cqe),
         .res = cqe->res,
+        .flags = cqe->flags,
     };
     io_uring_cqe_seen(ring, cqe);
 
@@ -229,6 +305,7 @@ static ssize_t api_collect_cqes(struct io_uring *ring, api_cqe_record_t *cqes, s
             cqes[count++] = (api_cqe_record_t) {
                 .user_data = io_uring_cqe_get_data64(batch_cqes[i]),
                 .res = batch_cqes[i]->res,
+                .flags = batch_cqes[i]->flags,
             };
             io_uring_cqe_seen(ring, batch_cqes[i]);
         }
@@ -344,6 +421,42 @@ static void api_handle_business(api_conn_t *conn, const api_request_t *request, 
     api_prepare_response(conn, "200 OK", "application/json", body, request->keep_alive);
 }
 
+static int api_finish_response(
+    struct io_uring *ring,
+    api_conn_t *conn,
+    int conn_index,
+    int *free_slots,
+    size_t *free_count
+) {
+    if (conn->pending_send_notifs > 0u) {
+        conn->send_complete_waiting_notif = true;
+        return 0;
+    }
+
+    conn->send_complete_waiting_notif = false;
+    if (!conn->keep_alive) {
+        api_request_close(conn);
+        api_maybe_finalize_conn(conn, conn_index, free_slots, free_count);
+        return 0;
+    }
+
+    conn->read_len = 0;
+    conn->write_len = 0;
+    conn->write_sent = 0;
+    return api_queue_recv(ring, conn, conn_index);
+}
+
+static bool api_send_zc_should_fallback(bool used_zerocopy, int res) {
+#if API_HAVE_SEND_ZC
+    return used_zerocopy
+        && (res == -EINVAL || res == -EOPNOTSUPP || res == -ENOBUFS || res == -ENOMEM);
+#else
+    (void) used_zerocopy;
+    (void) res;
+    return false;
+#endif
+}
+
 int main(void) {
     const char *index_path = getenv("RINHA_INDEX_PATH");
     if (index_path == NULL) {
@@ -436,6 +549,7 @@ int main(void) {
             int conn_index;
             uint32_t generation;
             int res = cqes[i].res;
+            unsigned flags = cqes[i].flags;
             api_unpack_user_data(user_data, &type, &conn_index, &generation);
 
             if (type == API_OP_ACCEPT) {
@@ -445,8 +559,10 @@ int main(void) {
                         api_conn_t *conn = &connections[accepted_conn_index];
                         conn->fd = res;
                         api_set_nonblocking(conn->fd);
+                        conn->zerocopy_enabled = api_try_enable_zerocopy(conn->fd);
                         if (api_queue_recv(&ring, conn, accepted_conn_index) < 0) {
-                            api_close_conn(conn, accepted_conn_index, free_slots, &free_count);
+                            api_request_close(conn);
+                            api_maybe_finalize_conn(conn, accepted_conn_index, free_slots, &free_count);
                             fatal_error = true;
                         } else {
                             need_submit = true;
@@ -470,10 +586,14 @@ int main(void) {
             if (!conn->used || conn->generation != generation) {
                 continue;
             }
+            if ((flags & IORING_CQE_F_NOTIF) == 0u && conn->inflight_ops > 0u) {
+                conn->inflight_ops--;
+            }
 
             if (type == API_OP_RECV) {
                 if (res <= 0) {
-                    api_close_conn(conn, conn_index, free_slots, &free_count);
+                    api_request_close(conn);
+                    api_maybe_finalize_conn(conn, conn_index, free_slots, &free_count);
                     continue;
                 }
 
@@ -513,11 +633,45 @@ int main(void) {
             }
 
             if (type == API_OP_SEND) {
-                if (res <= 0) {
-                    api_close_conn(conn, conn_index, free_slots, &free_count);
+                if ((flags & IORING_CQE_F_NOTIF) != 0u) {
+                    if (conn->pending_send_notifs > 0u) {
+                        conn->pending_send_notifs--;
+                    }
+                    if (res != 0) {
+                        conn->zerocopy_enabled = false;
+                    }
+                    if (conn->send_complete_waiting_notif && conn->pending_send_notifs == 0u) {
+                        int finish_rc = api_finish_response(&ring, conn, conn_index, free_slots, &free_count);
+                        if (finish_rc < 0) {
+                            fatal_error = true;
+                        } else if (finish_rc > 0) {
+                            need_submit = true;
+                        }
+                    }
+                    api_maybe_finalize_conn(conn, conn_index, free_slots, &free_count);
                     continue;
                 }
 
+                bool used_zerocopy = conn->send_inflight_zerocopy;
+                conn->send_inflight_zerocopy = false;
+                if (api_send_zc_should_fallback(used_zerocopy, res)) {
+                    conn->zerocopy_enabled = false;
+                    if (api_queue_send(&ring, conn, conn_index) < 0) {
+                        fatal_error = true;
+                    } else {
+                        need_submit = true;
+                    }
+                    continue;
+                }
+                if (res <= 0) {
+                    api_request_close(conn);
+                    api_maybe_finalize_conn(conn, conn_index, free_slots, &free_count);
+                    continue;
+                }
+
+                if (used_zerocopy && (flags & IORING_CQE_F_MORE) != 0u) {
+                    conn->pending_send_notifs++;
+                }
                 conn->write_sent += (size_t) res;
                 if (conn->write_sent < conn->write_len) {
                     if (api_queue_send(&ring, conn, conn_index) < 0) {
@@ -528,17 +682,10 @@ int main(void) {
                     continue;
                 }
 
-                if (!conn->keep_alive) {
-                    api_close_conn(conn, conn_index, free_slots, &free_count);
-                    continue;
-                }
-
-                conn->read_len = 0;
-                conn->write_len = 0;
-                conn->write_sent = 0;
-                if (api_queue_recv(&ring, conn, conn_index) < 0) {
+                int finish_rc = api_finish_response(&ring, conn, conn_index, free_slots, &free_count);
+                if (finish_rc < 0) {
                     fatal_error = true;
-                } else {
+                } else if (finish_rc > 0) {
                     need_submit = true;
                 }
             }
@@ -554,7 +701,7 @@ int main(void) {
 
     for (int i = 0; i < API_MAX_CONNECTIONS; i++) {
         if (connections[i].used) {
-            api_close_conn(&connections[i], i, free_slots, &free_count);
+            api_finalize_conn(&connections[i], i, free_slots, &free_count);
         }
     }
     free(connections);

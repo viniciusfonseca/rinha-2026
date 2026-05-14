@@ -235,6 +235,17 @@ Importante:
 4. Rebuild completo da imagem para regenerar `index.bin`.
 5. Revalide com smoke e com `make test-ci` ou `make test-ci-macos`.
 
+## io_uring e Zero-Copy
+
+- `src/api.c` e `src/lb.c` agora tentam usar `io_uring_prep_send_zc(...)` quando o socket aceita `SO_ZEROCOPY`.
+- O reuso do buffer de escrita ficou condicionado ao recebimento da CQE de notificacao (`IORING_CQE_F_NOTIF`), para nao sobrescrever memoria ainda em uso pelo kernel.
+- O fechamento de conexoes/sessoes tambem passou a ser adiado enquanto houver CQEs pendentes que ainda referenciem os buffers daquele slot.
+- Ha fallback automatico para `io_uring_prep_send(...)` quando `send_zc` nao e suportado ou falha em runtime.
+- Com a arquitetura atual, o ganho real fica concentrado no lado TCP do LB:
+  - `LB -> cliente TCP`: pode usar zero-copy.
+  - `LB -> API` via `AF_UNIX`: cai em fallback normal.
+  - `API -> LB` via `AF_UNIX`: cai em fallback normal.
+
 ## Proximos Pontos Naturais de Trabalho
 
 - Tentar eliminar o ultimo falso negativo sem reintroduzir timeout.
