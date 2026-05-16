@@ -96,6 +96,6 @@ clean:
 	rm -rf $(BIN_DIR)
 
 publish:
-	docker buildx build --platform linux/amd64 -t distanteagle16/rinha-2026:v2 --push .
+	docker buildx build --platform linux/amd64 -t distanteagle16/rinha-2026:v3 --push .
 
 .PHONY: all test up down up-macos down-macos test-ci test-ci-macos run-test clean
