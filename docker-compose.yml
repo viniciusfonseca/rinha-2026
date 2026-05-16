@@ -27,6 +27,8 @@ services:
     command: ["/usr/local/bin/fraud_lb"]
     environment:
       BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
+      RINHA_LB_PROFILE: ${RINHA_LB_PROFILE:-}
+      RINHA_LB_PROFILE_EVERY: ${RINHA_LB_PROFILE_EVERY:-}
     ports:
       - "9999:9999"
     depends_on:
