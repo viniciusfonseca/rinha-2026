@@ -36,7 +36,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - faz o parse JSON especializado do payload da Rinha
 
 - `src/vector_features.c`
-  - converte o payload parseado em um vetor de 14 dimensoes
+  - converte o payload parseado em um vetor logico de 14 dimensoes e o grava no layout fisico interno de 16 dimensoes
 
 - `src/vectorize_payload.h`
   - define o contrato interno entre parser de payload e vetorizacao
@@ -52,6 +52,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 
 - `src/common.h`
   - concentra dimensao do vetor, parametros globais do indice e `rinha_clamp01`
+  - estado atual: `RINHA_FEATURE_DIM = 14`, `RINHA_DIM = 16`
 
 - `src/quantize.c`
   - concentra quantizacao/dequantizacao em 16 bits
@@ -72,6 +73,7 @@ O estado atual e:
 - cada lista e ordenada por raio no preprocess e quebrada em blocos com metadados `min/max radius` para poda intra-lista
 - arquivo serializado sem payload morto de `PQ`
 - vetores armazenados em `uint16_t` para reduzir memoria e manter boa fidelidade
+- padding interno de `14 -> 16` dimensoes para alinhar o caminho AVX2 em `8 + 8`
 - em x86, o caminho de distancia usa SIMD AVX2 com dequantizacao direta em registrador; em outras arquiteturas existe fallback scalar
 
 Se encontrar documentacao antiga mencionando LSH como estrategia principal, trate como desatualizada e confirme no codigo atual.

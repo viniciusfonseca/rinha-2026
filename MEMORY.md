@@ -52,7 +52,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/index.c](./src/index.c)
   - Consulta o `index.bin`.
   - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos, podar listas restantes por raio sem `sqrt`, ordenar so as sobreviventes por `lower bound`, podar blocos intra-lista por faixa de raio e parar cedo quando o `top-5` ja esta matematicamente fechado.
-  - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, e corta o calculo assim que a soma parcial ja passa do pior do `top-5`.
+  - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, em duas metades `8 + 8`, e corta o calculo assim que a soma parcial ja passa do pior do `top-5`.
   - O scan de listas agora escolhe o caminho SIMD uma vez por request e reutiliza a query pre-carregada no loop, evitando decisao de ISA e recarga da query a cada vetor no hot path.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
@@ -60,15 +60,19 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/common.h](./src/common.h)
   - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
+    - `RINHA_FEATURE_DIM = 14`
+    - `RINHA_DIM = 16`
     - `RINHA_IVF_NLIST = 2048`
     - `RINHA_IVF_NPROBE = 4`
     - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
     - `RINHA_IVF_BLOCK_SIZE = 64`
+  - O armazenamento interno agora usa padding de `14 -> 16` dimensoes e um layout fisico reordenado para aproximar o `early-exit` do caminho scalar e alinhar o caminho AVX2 em `8 + 8`.
 
 - [src/quantize.c](./src/quantize.c)
   - Quantizacao/dequantizacao dos vetores armazenados no indice.
   - Vetores persistidos em `uint16_t` via `rinha_vector_scalar_t`.
+  - No preprocess, o dataset oficial continua sendo lido com `14` features logicas; o padding para `16` acontece apenas no armazenamento interno do indice.
 
 - [src/time_utils.c](./src/time_utils.c)
   - Helpers de calendario usados pela vetorizacao.
@@ -105,12 +109,12 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](./test/results.json):
-  - `p99 = 1.64ms`
+  - `p99 = 2.06ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 0`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5786.22`
+  - `final_score = 5685.08`
 
 Imagem local validada apos essa rodada:
 - `rinha-2026-local`
@@ -205,6 +209,7 @@ Importante:
     - `api2`: `avg_total_us=52.32`, `avg_plan_us=15.81`, `avg_probe_scan_us=21.53`, `avg_probe_kernel_us=20.82`, `avg_candidate_scan_us=8.79`
     - o volume medio caiu para ~`4436` vetores por request, sendo ~`3452` nas `probe lists` e ~`984` nas `candidate lists`
     - o custo de `plan` subiu por haver `2048` centroides, mas o ganho no `probe_kernel` compensou com folga
+  - padding posterior de `14 -> 16` dimensoes com layout fisico reordenado manteve a corretude funcional (`0` falsos positivos, `0` falsos negativos), mas no Mac `arm64` nao mostrou ganho claro fim a fim: o profile curto do indice ficou praticamente no mesmo patamar do baseline `NLIST=2048`, enquanto a rodada completa medida subiu para `p99 = 2.06ms`
 
 ## Telemetria do Load Balancer
 
