@@ -1,5 +1,5 @@
 x-api: &api
-  image: distanteagle16/rinha-2026:v3
+  image: distanteagle16/rinha-2026:v4
   platform: linux/amd64
   command: ["/usr/local/bin/fraud_api"]
   environment:
@@ -22,7 +22,7 @@ x-api: &api
 
 services:
   lb:
-    image: distanteagle16/rinha-2026:v3
+    image: distanteagle16/rinha-2026:v4
     platform: linux/amd64
     command: ["/usr/local/bin/fraud_lb"]
     environment:
