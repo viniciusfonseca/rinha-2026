@@ -161,6 +161,32 @@ Importante:
   - comparacao A/B em regime aquecido (`~200` calls por API) mostrou que a ordem reordenada derrubou o `probe_scan` de ~`82.95us`-`94.91us` para ~`60.06us`-`64.90us`, mantendo ~`8085` vetores nas probe lists
   - a mesma mudanca tambem reduziu `candidate_scan` de ~`21.17us`-`24.50us` para ~`14.06us`-`15.57us`
 
+## Telemetria do Load Balancer
+
+- O `LB` agora aceita profiler opcional por ambiente:
+  - `RINHA_LB_PROFILE=1`
+  - `RINHA_LB_PROFILE_EVERY=50`
+- O compose base faz passthrough dessas envs em [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml).
+- O profiler escreve em `stderr` agregados com:
+  - sessoes abertas/fechadas/ativas
+  - latencia media de `accept`, `connect`, `read(client)`, `read(backend)`, `write(backend)` e `write(client)`
+  - bytes medios por operacao
+  - batching do `io_uring` (`avg_cqes_per_wait`, `avg_sqes_per_submit`)
+  - contadores de `partial write`, `zerocopy notif` e `fallback`
+- Medicao em `macOS` local com `k6 run --vus 32 --iterations 400 test/smoke.js` mostrou:
+  - `sessions_opened=33`, `sessions_active=32`, `max_sessions_active=32`
+  - `avg_connect_us ~34us`
+  - `avg_write_backend_us ~39us`
+  - `avg_write_client_us ~69us`
+  - `avg_read_client_us ~1.42ms`
+  - `avg_read_backend_us ~1.42ms`
+  - `avg_cqes_per_wait ~5.9`
+  - `avg_sqes_per_submit ~9.4`
+- Leitura pratica:
+  - nesse cenario com keep-alive, o `LB` nao apareceu gargalando em `connect` nem em `write`
+  - o tempo dominante visto pelo `LB` e espera por dados (`read`), principalmente do backend
+  - isso sugere que o gargalo observado em carga curta estava mais em espera pelo processamento/resposta da API do que em custo interno do `LB`
+
 ## Compose e Ambientes
 
 - [docker-compose.yml](./docker-compose.yml)
