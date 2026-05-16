@@ -20,6 +20,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
   - Orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
   - Quando o indice retorna `2/5`, aplica um override estreito de fraude para um padrao remoto de alto risco antes de responder.
+  - O caminho de keep-alive depende de `api_finish_response` reenfileirar o proximo `recv` e retornar `> 0` para forcar novo `submit`; sem isso, o reuso de sockets internos trava na segunda reutilizacao.
 
 - [src/api_http.c](./src/api_http.c)
   - Parser HTTP pequeno para `GET /ready` e `POST /fraud-score`.
@@ -27,9 +28,11 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/lb.c](./src/lb.c)
   - Proxy TCP round-robin para clientes e proxy via unix sockets para as APIs.
-  - Transparente para HTTP; nao interpreta payload.
+  - Transparente para payload, mas agora interpreta fronteiras HTTP para reescrever `Connection` entre cliente e backend.
   - Usa identificador com `generation` em `user_data` para descartar CQEs antigos e evitar corrupcao em reuse de sessoes.
   - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
+  - Agora tambem suporta um pool quente de conexoes preabertas para os backends, configurado por `RINHA_LB_BACKEND_POOL_SIZE`.
+  - O pool agora recicla conexoes entre sessoes diferentes: o LB le a request inteira, reescreve `Connection: keep-alive` para a API, le a response inteira, reescreve o `Connection` de volta para o cliente e devolve o socket unix ao pool quando a API mantem a conexao aberta.
   - Foi ajustado para caber no limite de memoria do LB.
 
 - [src/vectorize.c](./src/vectorize.c)
@@ -166,6 +169,7 @@ Importante:
 - O `LB` agora aceita profiler opcional por ambiente:
   - `RINHA_LB_PROFILE=1`
   - `RINHA_LB_PROFILE_EVERY=50`
+  - `RINHA_LB_BACKEND_POOL_SIZE=16` por padrao; `0` desliga o pool
 - O compose base faz passthrough dessas envs em [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml).
 - O profiler escreve em `stderr` agregados com:
   - sessoes abertas/fechadas/ativas
@@ -186,6 +190,21 @@ Importante:
   - nesse cenario com keep-alive, o `LB` nao apareceu gargalando em `connect` nem em `write`
   - o tempo dominante visto pelo `LB` e espera por dados (`read`), principalmente do backend
   - isso sugere que o gargalo observado em carga curta estava mais em espera pelo processamento/resposta da API do que em custo interno do `LB`
+
+- Medicao da primeira versao do pool quente de backends:
+  - com `RINHA_LB_BACKEND_POOL_SIZE=16`, o profiler mostrou `pool_hits=100%`, `pool_misses=0` e `avg_connect_us=0`, movendo o custo para `avg_pool_connect_us ~25us`
+  - em benchmark sequencial com `100` requests `Connection: close`, o tempo ficou praticamente igual ao baseline sem pool, em torno de `160ms` por rodada de `100` requests
+  - em benchmark paralelo agressivo com `Connection: close`, tanto com pool quanto sem pool a medicao entrou no mesmo platô de timeout de `5s`
+  - conclusao daquela versao: o pool aquecia o caminho de conexao, mas ainda nao reciclava a mesma conexao entre sessoes
+
+- Medicao da versao com reuso real entre sessoes:
+  - com `RINHA_LB_BACKEND_POOL_SIZE=16`, `500` requests sequenciais com `Connection: close` geraram `pool_hits=500`, `pool_misses=0`, `connect_ops=0` e `pool_connect_ops=32`
+  - `pool_connect_ops=32` corresponde exatamente ao aquecimento inicial de `16` sockets para cada uma das `2` APIs; depois disso nao houve reconnect por request
+  - benchmark sequencial aquecido com `100` requests `Connection: close`:
+    - `pool=0`: ~`162.5ms` por rodada de `100`
+    - `pool=16` com reuso: ~`159.75ms` por rodada de `100`
+  - ganho observado: cerca de `1.7%` no melhor comparativo aquecido local
+  - leitura pratica: o reuso elimina `connect` por request e reduz syscalls, mas o ganho end-to-end ainda e limitado porque o maior tempo do LB continua sendo espera de `read` no backend, na faixa de ~`70us` por operacao
 
 ## Compose e Ambientes
 

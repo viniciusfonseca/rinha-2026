@@ -27,6 +27,8 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 - `src/lb.c`
   - proxy TCP entre cliente e LB, e unix sockets entre LB e APIs
   - mantem conexoes ativas e distribui em round-robin
+  - suporta um pool quente de conexoes preabertas para backend, controlado por `RINHA_LB_BACKEND_POOL_SIZE`
+  - o pool agora faz reuso real entre sessoes: request completa para a API com `keep-alive`, response completa de volta ao cliente e devolucao do socket unix ao pool quando possivel
   - drena CQEs em lote e faz flush de SQEs ao final de cada lote
 
 - `src/vectorize.c`
@@ -134,6 +136,7 @@ Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linu
 - a comunicacao interna LB -> API usa unix sockets em `/run/rinha`
 - o LB ja estourou memoria quando buffers e sessoes estavam grandes demais
 - o LB ja teve bug de reuse de sessao com CQEs antigos; preserve a logica de `generation`
+- o reuso de backend depende do keep-alive interno da API; se `api_finish_response` parar de reenfileirar/submitar o proximo `recv`, a reutilizacao trava na segunda rodada
 - o build da imagem depende de rede para baixar `references.json.gz`
 - `README.md` pode ficar atrasado em relacao ao estado real do indice
 

@@ -37,6 +37,7 @@ services:
       BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
       RINHA_LB_PROFILE: ${RINHA_LB_PROFILE:-}
       RINHA_LB_PROFILE_EVERY: ${RINHA_LB_PROFILE_EVERY:-}
+      RINHA_LB_BACKEND_POOL_SIZE: ${RINHA_LB_BACKEND_POOL_SIZE:-}
       # BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock,unix:/run/rinha/api3.sock
     ports:
       - "9999:9999"
