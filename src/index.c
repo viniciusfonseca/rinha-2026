@@ -35,6 +35,14 @@ typedef struct {
 } rinha_scan_window_t;
 
 typedef struct {
+    uint32_t vectors_scanned;
+    uint32_t blocks_scanned;
+    uint32_t blocks_pruned;
+    uint64_t prepare_ns;
+    uint64_t kernel_ns;
+} rinha_scan_stats_t;
+
+typedef struct {
     bool initialized;
     bool enabled;
     uint64_t report_every;
@@ -42,18 +50,26 @@ typedef struct {
     uint64_t total_ns;
     uint64_t plan_ns;
     uint64_t probe_scan_ns;
+    uint64_t probe_prepare_ns;
+    uint64_t probe_kernel_ns;
     uint64_t candidate_build_ns;
     uint64_t candidate_sort_ns;
     uint64_t candidate_scan_ns;
+    uint64_t candidate_prepare_ns;
+    uint64_t candidate_kernel_ns;
     uint64_t probe_lists_total;
     uint64_t probe_lists_scanned;
     uint64_t probe_lists_pruned_bound;
+    uint64_t probe_blocks_scanned;
+    uint64_t probe_blocks_pruned;
     uint64_t candidate_lists_considered;
     uint64_t candidate_lists_selected;
     uint64_t candidate_lists_scanned;
     uint64_t candidate_lists_pruned_radius;
     uint64_t candidate_lists_pruned_bound;
     uint64_t candidate_lists_skipped_after_sort;
+    uint64_t candidate_blocks_scanned;
+    uint64_t candidate_blocks_pruned;
     uint64_t vectors_scanned_probe;
     uint64_t vectors_scanned_candidate;
 } rinha_index_profile_t;
@@ -112,9 +128,13 @@ static void rinha_index_profile_report(const char *reason) {
     double avg_total_us = (double) rinha_index_profile.total_ns / calls / 1000.0;
     double avg_plan_us = (double) rinha_index_profile.plan_ns / calls / 1000.0;
     double avg_probe_scan_us = (double) rinha_index_profile.probe_scan_ns / calls / 1000.0;
+    double avg_probe_prepare_us = (double) rinha_index_profile.probe_prepare_ns / calls / 1000.0;
+    double avg_probe_kernel_us = (double) rinha_index_profile.probe_kernel_ns / calls / 1000.0;
     double avg_candidate_build_us = (double) rinha_index_profile.candidate_build_ns / calls / 1000.0;
     double avg_candidate_sort_us = (double) rinha_index_profile.candidate_sort_ns / calls / 1000.0;
     double avg_candidate_scan_us = (double) rinha_index_profile.candidate_scan_ns / calls / 1000.0;
+    double avg_candidate_prepare_us = (double) rinha_index_profile.candidate_prepare_ns / calls / 1000.0;
+    double avg_candidate_kernel_us = (double) rinha_index_profile.candidate_kernel_ns / calls / 1000.0;
     double avg_vectors_probe = (double) rinha_index_profile.vectors_scanned_probe / calls;
     double avg_vectors_candidate = (double) rinha_index_profile.vectors_scanned_candidate / calls;
 
@@ -122,28 +142,40 @@ static void rinha_index_profile_report(const char *reason) {
         stderr,
         "[index-prof] reason=%s calls=%" PRIu64
         " avg_total_us=%.2f avg_plan_us=%.2f avg_probe_scan_us=%.2f"
+        " avg_probe_prepare_us=%.2f avg_probe_kernel_us=%.2f"
         " avg_candidate_build_us=%.2f avg_candidate_sort_us=%.2f avg_candidate_scan_us=%.2f"
+        " avg_candidate_prepare_us=%.2f avg_candidate_kernel_us=%.2f"
         " avg_probe_lists=%.2f avg_probe_scanned=%.2f avg_probe_pruned_bound=%.2f"
+        " avg_probe_blocks_scanned=%.2f avg_probe_blocks_pruned=%.2f"
         " avg_candidate_considered=%.2f avg_candidate_selected=%.2f avg_candidate_scanned=%.2f"
         " avg_candidate_pruned_radius=%.2f avg_candidate_pruned_bound=%.2f avg_candidate_skipped_after_sort=%.2f"
+        " avg_candidate_blocks_scanned=%.2f avg_candidate_blocks_pruned=%.2f"
         " avg_vectors_probe=%.2f avg_vectors_candidate=%.2f avg_vectors_total=%.2f\n",
         reason,
         rinha_index_profile.calls,
         avg_total_us,
         avg_plan_us,
         avg_probe_scan_us,
+        avg_probe_prepare_us,
+        avg_probe_kernel_us,
         avg_candidate_build_us,
         avg_candidate_sort_us,
         avg_candidate_scan_us,
+        avg_candidate_prepare_us,
+        avg_candidate_kernel_us,
         (double) rinha_index_profile.probe_lists_total / calls,
         (double) rinha_index_profile.probe_lists_scanned / calls,
         (double) rinha_index_profile.probe_lists_pruned_bound / calls,
+        (double) rinha_index_profile.probe_blocks_scanned / calls,
+        (double) rinha_index_profile.probe_blocks_pruned / calls,
         (double) rinha_index_profile.candidate_lists_considered / calls,
         (double) rinha_index_profile.candidate_lists_selected / calls,
         (double) rinha_index_profile.candidate_lists_scanned / calls,
         (double) rinha_index_profile.candidate_lists_pruned_radius / calls,
         (double) rinha_index_profile.candidate_lists_pruned_bound / calls,
         (double) rinha_index_profile.candidate_lists_skipped_after_sort / calls,
+        (double) rinha_index_profile.candidate_blocks_scanned / calls,
+        (double) rinha_index_profile.candidate_blocks_pruned / calls,
         avg_vectors_probe,
         avg_vectors_candidate,
         avg_vectors_probe + avg_vectors_candidate
@@ -597,7 +629,9 @@ static uint32_t rinha_scan_window_scalar(
     const float *decode,
     float centroid_dist,
     float best_dist[5],
-    uint8_t best_label[5]
+    uint8_t best_label[5],
+    uint32_t *blocks_scanned,
+    uint32_t *blocks_pruned
 ) {
     const rinha_vector_scalar_t *vectors = index->vectors;
     const uint8_t *labels = index->labels;
@@ -624,13 +658,16 @@ static uint32_t rinha_scan_window_scalar(
             float current_lower = centroid_dist > cutoff_dist ? centroid_dist - cutoff_dist : 0.0f;
             float current_upper = centroid_dist + cutoff_dist;
             if (block_max_radii[block] < current_lower) {
+                (*blocks_pruned)++;
                 continue;
             }
             if (block_min_radii[block] > current_upper) {
+                *blocks_pruned += window->candidate_block_end - block;
                 break;
             }
         }
 
+        (*blocks_scanned)++;
         uint32_t item_start = 0u;
         uint32_t item_end = 0u;
         rinha_block_item_range(window, block, &item_start, &item_end);
@@ -658,7 +695,9 @@ static uint32_t rinha_scan_window_avx2(
     const float query[RINHA_DIM],
     float centroid_dist,
     float best_dist[5],
-    uint8_t best_label[5]
+    uint8_t best_label[5],
+    uint32_t *blocks_scanned,
+    uint32_t *blocks_pruned
 ) {
     const rinha_vector_scalar_t *vectors = index->vectors;
     const uint8_t *labels = index->labels;
@@ -675,13 +714,16 @@ static uint32_t rinha_scan_window_avx2(
             float current_lower = centroid_dist > cutoff_dist ? centroid_dist - cutoff_dist : 0.0f;
             float current_upper = centroid_dist + cutoff_dist;
             if (block_max_radii[block] < current_lower) {
+                (*blocks_pruned)++;
                 continue;
             }
             if (block_min_radii[block] > current_upper) {
+                *blocks_pruned += window->candidate_block_end - block;
                 break;
             }
         }
 
+        (*blocks_scanned)++;
         uint32_t item_start = 0u;
         uint32_t item_end = 0u;
         rinha_block_item_range(window, block, &item_start, &item_end);
@@ -698,29 +740,66 @@ static uint32_t rinha_scan_window_avx2(
 }
 #endif
 
-static uint32_t rinha_scan_list(
+static rinha_scan_stats_t rinha_scan_list(
     const rinha_index_t *index,
     const float query[RINHA_DIM],
     const float *decode,
     uint32_t list,
     float centroid_dist,
+    bool profile_enabled,
     bool use_avx2,
     float best_dist[5],
     uint8_t best_label[5]
 ) {
+    rinha_scan_stats_t stats = {0};
     rinha_scan_window_t window;
+    uint64_t started_ns = profile_enabled ? rinha_now_ns() : 0u;
     if (!rinha_prepare_scan_window(index, list, centroid_dist, best_dist[4], &window)) {
-        return 0u;
+        if (profile_enabled && started_ns != 0u) {
+            stats.prepare_ns = rinha_now_ns() - started_ns;
+        }
+        return stats;
+    }
+    if (profile_enabled && started_ns != 0u) {
+        stats.prepare_ns = rinha_now_ns() - started_ns;
+        started_ns = rinha_now_ns();
     }
 
 #if defined(__x86_64__) || defined(__i386__)
     if (use_avx2) {
-        return rinha_scan_window_avx2(index, &window, query, centroid_dist, best_dist, best_label);
+        stats.vectors_scanned = rinha_scan_window_avx2(
+            index,
+            &window,
+            query,
+            centroid_dist,
+            best_dist,
+            best_label,
+            &stats.blocks_scanned,
+            &stats.blocks_pruned
+        );
+        if (profile_enabled && started_ns != 0u) {
+            stats.kernel_ns = rinha_now_ns() - started_ns;
+        }
+        return stats;
     }
 #else
     (void) use_avx2;
 #endif
-    return rinha_scan_window_scalar(index, &window, query, decode, centroid_dist, best_dist, best_label);
+    stats.vectors_scanned = rinha_scan_window_scalar(
+        index,
+        &window,
+        query,
+        decode,
+        centroid_dist,
+        best_dist,
+        best_label,
+        &stats.blocks_scanned,
+        &stats.blocks_pruned
+    );
+    if (profile_enabled && started_ns != 0u) {
+        stats.kernel_ns = rinha_now_ns() - started_ns;
+    }
+    return stats;
 }
 
 int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_DIM]) {
@@ -729,17 +808,25 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     uint64_t phase_start_ns = 0u;
     uint64_t plan_ns = 0u;
     uint64_t probe_scan_ns = 0u;
+    uint64_t probe_prepare_ns = 0u;
+    uint64_t probe_kernel_ns = 0u;
     uint64_t candidate_build_ns = 0u;
     uint64_t candidate_sort_ns = 0u;
     uint64_t candidate_scan_ns = 0u;
+    uint64_t candidate_prepare_ns = 0u;
+    uint64_t candidate_kernel_ns = 0u;
     uint64_t probe_lists_scanned = 0u;
     uint64_t probe_lists_pruned_bound = 0u;
+    uint64_t probe_blocks_scanned = 0u;
+    uint64_t probe_blocks_pruned = 0u;
     uint64_t candidate_lists_considered = 0u;
     uint64_t candidate_lists_selected = 0u;
     uint64_t candidate_lists_scanned = 0u;
     uint64_t candidate_lists_pruned_radius = 0u;
     uint64_t candidate_lists_pruned_bound = 0u;
     uint64_t candidate_lists_skipped_after_sort = 0u;
+    uint64_t candidate_blocks_scanned = 0u;
+    uint64_t candidate_blocks_pruned = 0u;
     uint64_t vectors_scanned_probe = 0u;
     uint64_t vectors_scanned_candidate = 0u;
 
@@ -776,7 +863,22 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
             continue;
         }
         probe_lists_scanned++;
-        vectors_scanned_probe += rinha_scan_list(index, query, decode, list, centroid_dist, use_avx2, best_dist, best_label);
+        rinha_scan_stats_t stats = rinha_scan_list(
+            index,
+            query,
+            decode,
+            list,
+            centroid_dist,
+            profile_enabled,
+            use_avx2,
+            best_dist,
+            best_label
+        );
+        vectors_scanned_probe += stats.vectors_scanned;
+        probe_blocks_scanned += stats.blocks_scanned;
+        probe_blocks_pruned += stats.blocks_pruned;
+        probe_prepare_ns += stats.prepare_ns;
+        probe_kernel_ns += stats.kernel_ns;
     }
     if (profile_enabled) {
         probe_scan_ns = rinha_now_ns() - phase_start_ns;
@@ -826,7 +928,22 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         candidate_lists_scanned++;
         uint32_t list = candidate_lists[i].list;
         float centroid_dist = sqrtf(centroid_dist_sq[list]);
-        vectors_scanned_candidate += rinha_scan_list(index, query, decode, list, centroid_dist, use_avx2, best_dist, best_label);
+        rinha_scan_stats_t stats = rinha_scan_list(
+            index,
+            query,
+            decode,
+            list,
+            centroid_dist,
+            profile_enabled,
+            use_avx2,
+            best_dist,
+            best_label
+        );
+        vectors_scanned_candidate += stats.vectors_scanned;
+        candidate_blocks_scanned += stats.blocks_scanned;
+        candidate_blocks_pruned += stats.blocks_pruned;
+        candidate_prepare_ns += stats.prepare_ns;
+        candidate_kernel_ns += stats.kernel_ns;
     }
     if (profile_enabled) {
         candidate_scan_ns = rinha_now_ns() - phase_start_ns;
@@ -842,18 +959,26 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         rinha_index_profile.total_ns += rinha_now_ns() - total_start_ns;
         rinha_index_profile.plan_ns += plan_ns;
         rinha_index_profile.probe_scan_ns += probe_scan_ns;
+        rinha_index_profile.probe_prepare_ns += probe_prepare_ns;
+        rinha_index_profile.probe_kernel_ns += probe_kernel_ns;
         rinha_index_profile.candidate_build_ns += candidate_build_ns;
         rinha_index_profile.candidate_sort_ns += candidate_sort_ns;
         rinha_index_profile.candidate_scan_ns += candidate_scan_ns;
+        rinha_index_profile.candidate_prepare_ns += candidate_prepare_ns;
+        rinha_index_profile.candidate_kernel_ns += candidate_kernel_ns;
         rinha_index_profile.probe_lists_total += probe_count;
         rinha_index_profile.probe_lists_scanned += probe_lists_scanned;
         rinha_index_profile.probe_lists_pruned_bound += probe_lists_pruned_bound;
+        rinha_index_profile.probe_blocks_scanned += probe_blocks_scanned;
+        rinha_index_profile.probe_blocks_pruned += probe_blocks_pruned;
         rinha_index_profile.candidate_lists_considered += candidate_lists_considered;
         rinha_index_profile.candidate_lists_selected += candidate_lists_selected;
         rinha_index_profile.candidate_lists_scanned += candidate_lists_scanned;
         rinha_index_profile.candidate_lists_pruned_radius += candidate_lists_pruned_radius;
         rinha_index_profile.candidate_lists_pruned_bound += candidate_lists_pruned_bound;
         rinha_index_profile.candidate_lists_skipped_after_sort += candidate_lists_skipped_after_sort;
+        rinha_index_profile.candidate_blocks_scanned += candidate_blocks_scanned;
+        rinha_index_profile.candidate_blocks_pruned += candidate_blocks_pruned;
         rinha_index_profile.vectors_scanned_probe += vectors_scanned_probe;
         rinha_index_profile.vectors_scanned_candidate += vectors_scanned_candidate;
 

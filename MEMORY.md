@@ -21,6 +21,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
   - Quando o indice retorna `2/5`, aplica um override estreito de fraude para um padrao remoto de alto risco antes de responder.
   - O caminho de keep-alive depende de `api_finish_response` reenfileirar o proximo `recv` e retornar `> 0` para forcar novo `submit`; sem isso, o reuso de sockets internos trava na segunda reutilizacao.
+  - Agora tambem aceita profiler opcional para comparar recebimento/parsing da request com `handle business`.
 
 - [src/api_http.c](./src/api_http.c)
   - Parser HTTP pequeno para `GET /ready` e `POST /fraud-score`.
@@ -59,7 +60,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/common.h](./src/common.h)
   - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
-    - `RINHA_IVF_NLIST = 1024`
+    - `RINHA_IVF_NLIST = 2048`
     - `RINHA_IVF_NPROBE = 4`
     - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
@@ -104,12 +105,12 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](./test/results.json):
-  - `p99 = 1.83ms`
+  - `p99 = 1.64ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 0`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5737.79`
+  - `final_score = 5786.22`
 
 Imagem local validada apos essa rodada:
 - `rinha-2026-local`
@@ -143,6 +144,32 @@ Importante:
   - `curl -sS -D - -o /dev/null http://localhost:9999/ready`
   - `curl -sS -D - -H "Content-Type: application/json" --data-raw @payload.json http://localhost:9999/fraud-score`
 
+## Telemetria da API
+
+- A API agora aceita profiler opcional por ambiente:
+  - `RINHA_API_PROFILE=1`
+  - `RINHA_API_PROFILE_EVERY=1000`
+- O compose base faz passthrough dessas envs em [docker-compose.yml](./docker-compose.yml).
+- O profiler escreve em `stderr` agregados com:
+  - `avg_request_recv_us`: tempo medio desde o primeiro `recv` concluido ate a request ficar completa
+  - `avg_parse_us`: tempo medio gasto dentro de `api_parse_http_request`
+  - `avg_handle_business_us`: tempo medio gasto dentro de `api_handle_business`
+  - `avg_payload_parse_us`, `avg_vectorize_us`, `avg_index_us` e `avg_finalize_us` para quebrar `handle business`
+  - `handle_vs_recv`: razao entre processamento e recebimento
+  - `avg_recv_ops` e `avg_request_bytes`
+- Medicao local em `macOS` com `docker-compose.yml` + `docker-compose.macos.yml` e `k6 run --vus 32 --iterations 400 test/smoke.js`:
+  - `api1` em `400` requests: `avg_request_recv_us=1.52`, `avg_parse_us=1.42`, `avg_handle_business_us=108.26`, `handle_vs_recv=71.35x`
+  - `api2` em `400` requests: `avg_request_recv_us=0.43`, `avg_parse_us=0.35`, `avg_handle_business_us=58.61`, `handle_vs_recv=136.10x`
+  - nas duas APIs, `avg_recv_ops=1.00` e `avg_request_bytes=600.00`
+- Leitura pratica:
+  - no fluxo interno atual por unix socket, a request quase sempre chega inteira em um unico `recv`
+  - o custo de parse e muito pequeno
+  - o custo dominante da API continua sendo `handle business`, varias dezenas a mais de `100x` maior que o tempo de recebimento/parsing
+  - dentro de `handle business`, a consulta ao indice domina quase tudo:
+    - `api1` em `400` requests: `avg_handle_business_us=52.29`, com `avg_index_us=50.99`
+    - `api2` em `400` requests: `avg_handle_business_us=46.16`, com `avg_index_us=45.01`
+  - isso coloca `avg_index_us` em ~`97.5%` do tempo de `handle business` nas duas APIs
+
 ## Telemetria do Indice
 
 - O indice agora aceita profiler opcional por ambiente:
@@ -150,7 +177,9 @@ Importante:
   - `RINHA_INDEX_PROFILE_EVERY=1000`
 - Quando habilitado, cada processo de API escreve em `stderr` um agregado com:
   - tempo medio por fase da `rinha_index_fraud_count_top5`
+  - detalhamento do scan em `probe_prepare`, `probe_kernel`, `candidate_prepare` e `candidate_kernel`
   - listas escaneadas e podadas
+  - blocos escaneados e podados nas probe lists e nas candidate lists
   - vetores escaneados nas probe lists e nas candidate lists
 - O custo quando desligado fica baixo; o caminho padrao continua sem telemetria.
 - Ultima comparacao util com a telemetria:
@@ -163,6 +192,19 @@ Importante:
   - em `linux/arm64/v8` no Mac, a ordem de acumulacao do kernel escalar em `rinha_distance_sq_scalar_preloaded` importa bastante para o `early-exit`
   - comparacao A/B em regime aquecido (`~200` calls por API) mostrou que a ordem reordenada derrubou o `probe_scan` de ~`82.95us`-`94.91us` para ~`60.06us`-`64.90us`, mantendo ~`8085` vetores nas probe lists
   - a mesma mudanca tambem reduziu `candidate_scan` de ~`21.17us`-`24.50us` para ~`14.06us`-`15.57us`
+  - profile detalhado da busca em `400` calls por API:
+    - `api1`: `avg_total_us=72.25`, `avg_plan_us=7.39`, `avg_probe_scan_us=50.60`, `avg_probe_prepare_us=0.37`, `avg_probe_kernel_us=49.77`, `avg_candidate_build_us=2.20`, `avg_candidate_sort_us=0.70`, `avg_candidate_scan_us=10.58`, `avg_candidate_prepare_us=2.18`, `avg_candidate_kernel_us=6.53`
+    - `api2`: `avg_total_us=72.94`, `avg_plan_us=8.21`, `avg_probe_scan_us=50.43`, `avg_probe_prepare_us=0.40`, `avg_probe_kernel_us=49.59`, `avg_candidate_build_us=2.40`, `avg_candidate_sort_us=0.78`, `avg_candidate_scan_us=10.48`, `avg_candidate_prepare_us=2.22`, `avg_candidate_kernel_us=6.45`
+  - leitura pratica do profile detalhado:
+    - o maior gargalo interno da busca e `probe_kernel`, isto e, o calculo efetivo de distancia dentro das `probe lists`
+    - `probe_prepare` e pequeno, na faixa de ~`0.37us`-`0.40us`
+    - `candidate_kernel` tambem pesa, mas bem menos, na faixa de ~`6.45us`-`6.53us`
+    - o scan de probe listas passa por ~`127` blocos escaneados e ~`7` blocos podados por request; o scan de candidate listas passa por ~`28` blocos escaneados e praticamente nao poda blocos nesse cenario
+  - retuning posterior para `NLIST=2048` melhorou a busca em `linux/arm64/v8` no Mac:
+    - `api1`: `avg_total_us=56.60`, `avg_plan_us=16.38`, `avg_probe_scan_us=22.70`, `avg_probe_kernel_us=21.88`, `avg_candidate_scan_us=10.82`
+    - `api2`: `avg_total_us=52.32`, `avg_plan_us=15.81`, `avg_probe_scan_us=21.53`, `avg_probe_kernel_us=20.82`, `avg_candidate_scan_us=8.79`
+    - o volume medio caiu para ~`4436` vetores por request, sendo ~`3452` nas `probe lists` e ~`984` nas `candidate lists`
+    - o custo de `plan` subiu por haver `2048` centroides, mas o ganho no `probe_kernel` compensou com folga
 
 ## Telemetria do Load Balancer
 

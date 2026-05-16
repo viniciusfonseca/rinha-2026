@@ -20,6 +20,7 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - usa `generation` em `user_data` para evitar reaproveitamento incorreto de CQEs
   - drena CQEs em lote e faz flush de SQEs ao final de cada lote
   - orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON
+  - aceita profiler opcional via `RINHA_API_PROFILE` para comparar recebimento/parsing da request com `handle business`
 
 - `src/api_http.c`
   - faz o parse HTTP de rota, `Content-Length`, corpo e `keep-alive`
@@ -124,11 +125,16 @@ Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linu
 
 ## Telemetria Opcional
 
+- Para perfilar recebimento/parsing da API versus `handle business`, use:
+  - `RINHA_API_PROFILE=1`
+  - `RINHA_API_PROFILE_EVERY=1000`
+- Os logs mostram tempo medio de recebimento completo da request, parse HTTP, `handle business` e a quebra interna de `handle business` em `payload_parse`, `vectorize`, `index` e `finalize`.
+
 - Para perfilar a busca do indice sem mudar codigo, use:
   - `RINHA_INDEX_PROFILE=1`
   - `RINHA_INDEX_PROFILE_EVERY=1000`
 - As APIs passam essas variaveis pelo `docker-compose.yml`.
-- Os logs mostram tempo medio por fase e volume medio de listas e vetores escaneados por request.
+- Os logs mostram tempo medio por fase, quebra de scan em `prepare` e `kernel`, e volume medio de listas, blocos e vetores escaneados por request.
 
 ## Armadilhas Conhecidas
 
