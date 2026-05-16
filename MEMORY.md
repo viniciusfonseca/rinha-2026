@@ -12,7 +12,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 ## Arquitetura Atual
 
-- [src/api.c](/Users/viniciusfonseca/projects/rinha-2026/src/api.c)
+- [src/api.c](./src/api.c)
   - Servidor HTTP em `io_uring`.
   - Exponibiliza `GET /ready` e `POST /fraud-score`.
   - Mantem `keep-alive` por padrao, a menos que receba `Connection: close`.
@@ -21,31 +21,31 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
   - Quando o indice retorna `2/5`, aplica um override estreito de fraude para um padrao remoto de alto risco antes de responder.
 
-- [src/api_http.c](/Users/viniciusfonseca/projects/rinha-2026/src/api_http.c)
+- [src/api_http.c](./src/api_http.c)
   - Parser HTTP pequeno para `GET /ready` e `POST /fraud-score`.
   - Centraliza deteccao de rota, `Content-Length`, corpo e `keep-alive`.
 
-- [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
+- [src/lb.c](./src/lb.c)
   - Proxy TCP round-robin para clientes e proxy via unix sockets para as APIs.
   - Transparente para HTTP; nao interpreta payload.
   - Usa identificador com `generation` em `user_data` para descartar CQEs antigos e evitar corrupcao em reuse de sessoes.
   - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
   - Foi ajustado para caber no limite de memoria do LB.
 
-- [src/vectorize.c](/Users/viniciusfonseca/projects/rinha-2026/src/vectorize.c)
+- [src/vectorize.c](./src/vectorize.c)
   - Parser JSON especializado do payload da Rinha.
   - Preenche `rinha_tx_payload_t` sem alocar memoria dinamica.
 
-- [src/vector_features.c](/Users/viniciusfonseca/projects/rinha-2026/src/vector_features.c)
+- [src/vector_features.c](./src/vector_features.c)
   - Converte `rinha_tx_payload_t` em vetor de 14 dimensoes.
   - Centraliza normalizacao e riscos por MCC.
   - Tambem concentra o override de borda usado quando o KNN devolve `2/5` mas o payload mostra um padrao remoto fortemente anomalo.
 
-- [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
+- [src/preprocess.c](./src/preprocess.c)
   - Baixa o dataset oficial no build da imagem e gera `index.bin`.
   - Hoje gera estrutura IVF enxuta com centroides, offsets por lista, raios por lista, blocos por lista com `min/max radius`, labels e vetores quantizados em `16 bits`.
 
-- [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
+- [src/index.c](./src/index.c)
   - Consulta o `index.bin`.
   - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos, podar listas restantes por raio sem `sqrt`, ordenar so as sobreviventes por `lower bound`, podar blocos intra-lista por faixa de raio e parar cedo quando o `top-5` ja esta matematicamente fechado.
   - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, e corta o calculo assim que a soma parcial ja passa do pior do `top-5`.
@@ -53,7 +53,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
 
-- [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
+- [src/common.h](./src/common.h)
   - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
     - `RINHA_IVF_NLIST = 1024`
@@ -62,16 +62,16 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
     - `RINHA_IVF_KMEANS_ITERS = 16`
     - `RINHA_IVF_BLOCK_SIZE = 64`
 
-- [src/quantize.c](/Users/viniciusfonseca/projects/rinha-2026/src/quantize.c)
+- [src/quantize.c](./src/quantize.c)
   - Quantizacao/dequantizacao dos vetores armazenados no indice.
   - Vetores persistidos em `uint16_t` via `rinha_vector_scalar_t`.
 
-- [src/time_utils.c](/Users/viniciusfonseca/projects/rinha-2026/src/time_utils.c)
+- [src/time_utils.c](./src/time_utils.c)
   - Helpers de calendario usados pela vetorizacao.
 
 ## Formato do Indice
 
-- Arquivo: [src/index_format.h](/Users/viniciusfonseca/projects/rinha-2026/src/index_format.h)
+- Arquivo: [src/index_format.h](./src/index_format.h)
 - Versao atual:
   - `RINHA_INDEX_MAGIC = "R26IV10"`
   - `RINHA_INDEX_VERSION = 10`
@@ -100,7 +100,7 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - compose: `docker-compose.yml` + `docker-compose.macos.yml`
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
-- resultado em [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json):
+- resultado em [test/results.json](./test/results.json):
   - `p99 = 1.83ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
@@ -157,16 +157,19 @@ Importante:
   - o maior custo continua sendo `probe_scan`, em ~`0.084ms`-`0.087ms`; `candidate_scan` caiu para ~`0.024ms`
   - o volume medio caiu para ~`9391` vetores por request, sendo ~`8085` nas `probe lists` e ~`1306` nas `candidate lists`
   - a poda por raio entre listas continua forte, com ~`992` listas descartadas antes do scan; depois disso, a poda intra-lista derruba o trabalho residual dentro das `28` listas candidatas sobreviventes
+  - em `linux/arm64/v8` no Mac, a ordem de acumulacao do kernel escalar em `rinha_distance_sq_scalar_preloaded` importa bastante para o `early-exit`
+  - comparacao A/B em regime aquecido (`~200` calls por API) mostrou que a ordem reordenada derrubou o `probe_scan` de ~`82.95us`-`94.91us` para ~`60.06us`-`64.90us`, mantendo ~`8085` vetores nas probe lists
+  - a mesma mudanca tambem reduziu `candidate_scan` de ~`21.17us`-`24.50us` para ~`14.06us`-`15.57us`
 
 ## Compose e Ambientes
 
-- [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml)
+- [docker-compose.yml](./docker-compose.yml)
   - Base oficial.
   - `platform: linux/amd64`.
   - Orcamento total da Rinha dividido entre `lb`, `api1` e `api2`.
   - `lb` e `api1/api2` compartilham um volume com sockets unix em `/run/rinha`.
 
-- [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
+- [docker-compose.macos.yml](./docker-compose.macos.yml)
   - Excecao para desenvolvimento local em Mac.
   - Usa `linux/arm64/v8`.
   - Mantem o mesmo desenho de recursos do compose oficial.
@@ -195,7 +198,7 @@ Importante:
   - Para o estado atual, confie mais em `src/index.c`, `src/preprocess.c`, `src/quantize.c`, `src/common.h` e neste arquivo.
 
 - O build da imagem depende de rede.
-  - [Dockerfile](/Users/viniciusfonseca/projects/rinha-2026/Dockerfile) baixa `references.json.gz` do repositorio oficial durante o build.
+  - [Dockerfile](./Dockerfile) baixa `references.json.gz` do repositorio oficial durante o build.
 
 ## Invariantes Importantes
 
@@ -211,21 +214,21 @@ Importante:
 
 ## Arquivos Mais Importantes
 
-- [Makefile](/Users/viniciusfonseca/projects/rinha-2026/Makefile)
-- [Dockerfile](/Users/viniciusfonseca/projects/rinha-2026/Dockerfile)
-- [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml)
-- [docker-compose.macos.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.macos.yml)
-- [src/api.c](/Users/viniciusfonseca/projects/rinha-2026/src/api.c)
-- [src/api_http.c](/Users/viniciusfonseca/projects/rinha-2026/src/api_http.c)
-- [src/lb.c](/Users/viniciusfonseca/projects/rinha-2026/src/lb.c)
-- [src/preprocess.c](/Users/viniciusfonseca/projects/rinha-2026/src/preprocess.c)
-- [src/index.c](/Users/viniciusfonseca/projects/rinha-2026/src/index.c)
-- [src/common.h](/Users/viniciusfonseca/projects/rinha-2026/src/common.h)
-- [src/quantize.c](/Users/viniciusfonseca/projects/rinha-2026/src/quantize.c)
-- [src/vectorize.c](/Users/viniciusfonseca/projects/rinha-2026/src/vectorize.c)
-- [src/vector_features.c](/Users/viniciusfonseca/projects/rinha-2026/src/vector_features.c)
-- [test/test.js](/Users/viniciusfonseca/projects/rinha-2026/test/test.js)
-- [test/results.json](/Users/viniciusfonseca/projects/rinha-2026/test/results.json)
+- [Makefile](./Makefile)
+- [Dockerfile](./Dockerfile)
+- [docker-compose.yml](./docker-compose.yml)
+- [docker-compose.macos.yml](./docker-compose.macos.yml)
+- [src/api.c](./src/api.c)
+- [src/api_http.c](./src/api_http.c)
+- [src/lb.c](./src/lb.c)
+- [src/preprocess.c](./src/preprocess.c)
+- [src/index.c](./src/index.c)
+- [src/common.h](./src/common.h)
+- [src/quantize.c](./src/quantize.c)
+- [src/vectorize.c](./src/vectorize.c)
+- [src/vector_features.c](./src/vector_features.c)
+- [test/test.js](./test/test.js)
+- [test/results.json](./test/results.json)
 
 ## Quando For Mexer No Indice
 
@@ -241,10 +244,12 @@ Importante:
 - O reuso do buffer de escrita ficou condicionado ao recebimento da CQE de notificacao (`IORING_CQE_F_NOTIF`), para nao sobrescrever memoria ainda em uso pelo kernel.
 - O fechamento de conexoes/sessoes tambem passou a ser adiado enquanto houver CQEs pendentes que ainda referenciem os buffers daquele slot.
 - Ha fallback automatico para `io_uring_prep_send(...)` quando `send_zc` nao e suportado ou falha em runtime.
+- `src/api.c` e `src/lb.c` aceitam `RINHA_DISABLE_SEND_ZC=1` para desligar zero-copy explicitamente em ambientes onde o caminho com `send_zc` nao e estavel.
 - Com a arquitetura atual, o ganho real fica concentrado no lado TCP do LB:
   - `LB -> cliente TCP`: pode usar zero-copy.
   - `LB -> API` via `AF_UNIX`: cai em fallback normal.
   - `API -> LB` via `AF_UNIX`: cai em fallback normal.
+- Em macOS local, o override [docker-compose.macos.yml](./docker-compose.macos.yml) usa `linux/arm64/v8`, `privileged: true` e `RINHA_DISABLE_SEND_ZC=1` para permitir profiling sem travar `POST /fraud-score`.
 
 ## Proximos Pontos Naturais de Trabalho
 

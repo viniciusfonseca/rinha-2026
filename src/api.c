@@ -149,6 +149,14 @@ static int api_open_listener(const char *socket_path) {
 
 static bool api_try_enable_zerocopy(int fd) {
 #if API_HAVE_SEND_ZC
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *env = getenv("RINHA_DISABLE_SEND_ZC");
+        disabled = env != NULL && strcmp(env, "0") != 0 && env[0] != '\0';
+    }
+    if (disabled) {
+        return false;
+    }
     int one = 1;
     return setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one)) == 0;
 #else

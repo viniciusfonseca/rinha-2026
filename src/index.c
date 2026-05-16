@@ -187,47 +187,47 @@ static inline float rinha_distance_sq_scalar_preloaded(
     const float *decode,
     float cutoff
 ) {
-    float diff0 = query0 - decode[vector[0]];
-    float diff1 = query1 - decode[vector[1]];
     float diff2 = query2 - decode[vector[2]];
-    float diff3 = query3 - decode[vector[3]];
-    float diff4 = query4 - decode[vector[4]];
-    float diff5 = query5 - decode[vector[5]];
     float diff6 = query6 - decode[vector[6]];
-    float diff7 = query7 - decode[vector[7]];
+    float diff12 = query12 - decode[vector[12]];
+    float diff5 = query5 - decode[vector[5]];
+    float diff11 = query11 - decode[vector[11]];
     float diff8 = query8 - decode[vector[8]];
+    float diff7 = query7 - decode[vector[7]];
+    float diff0 = query0 - decode[vector[0]];
+    float diff13 = query13 - decode[vector[13]];
     float diff9 = query9 - decode[vector[9]];
     float diff10 = query10 - decode[vector[10]];
-    float diff11 = query11 - decode[vector[11]];
-    float diff12 = query12 - decode[vector[12]];
-    float diff13 = query13 - decode[vector[13]];
+    float diff3 = query3 - decode[vector[3]];
+    float diff4 = query4 - decode[vector[4]];
+    float diff1 = query1 - decode[vector[1]];
     float sum = 0.0f;
-    diff0 *= diff0;
-    sum += diff0;
-    if (sum >= cutoff) return sum;
-    diff1 *= diff1;
-    sum += diff1;
-    if (sum >= cutoff) return sum;
     diff2 *= diff2;
     sum += diff2;
-    if (sum >= cutoff) return sum;
-    diff3 *= diff3;
-    sum += diff3;
-    if (sum >= cutoff) return sum;
-    diff4 *= diff4;
-    sum += diff4;
-    if (sum >= cutoff) return sum;
-    diff5 *= diff5;
-    sum += diff5;
     if (sum >= cutoff) return sum;
     diff6 *= diff6;
     sum += diff6;
     if (sum >= cutoff) return sum;
-    diff7 *= diff7;
-    sum += diff7;
+    diff12 *= diff12;
+    sum += diff12;
+    if (sum >= cutoff) return sum;
+    diff5 *= diff5;
+    sum += diff5;
+    if (sum >= cutoff) return sum;
+    diff11 *= diff11;
+    sum += diff11;
     if (sum >= cutoff) return sum;
     diff8 *= diff8;
     sum += diff8;
+    if (sum >= cutoff) return sum;
+    diff7 *= diff7;
+    sum += diff7;
+    if (sum >= cutoff) return sum;
+    diff0 *= diff0;
+    sum += diff0;
+    if (sum >= cutoff) return sum;
+    diff13 *= diff13;
+    sum += diff13;
     if (sum >= cutoff) return sum;
     diff9 *= diff9;
     sum += diff9;
@@ -235,14 +235,14 @@ static inline float rinha_distance_sq_scalar_preloaded(
     diff10 *= diff10;
     sum += diff10;
     if (sum >= cutoff) return sum;
-    diff11 *= diff11;
-    sum += diff11;
+    diff3 *= diff3;
+    sum += diff3;
     if (sum >= cutoff) return sum;
-    diff12 *= diff12;
-    sum += diff12;
+    diff4 *= diff4;
+    sum += diff4;
     if (sum >= cutoff) return sum;
-    diff13 *= diff13;
-    sum += diff13;
+    diff1 *= diff1;
+    sum += diff1;
     return sum;
 }
 
@@ -576,6 +576,20 @@ static bool rinha_prepare_scan_window(
     return true;
 }
 
+static void rinha_block_item_range(
+    const rinha_scan_window_t *window,
+    uint32_t block,
+    uint32_t *item_start,
+    uint32_t *item_end
+) {
+    uint32_t local_block = block - window->block_begin;
+    *item_start = window->start + local_block * RINHA_IVF_BLOCK_SIZE;
+    *item_end = *item_start + RINHA_IVF_BLOCK_SIZE;
+    if (*item_end > window->end) {
+        *item_end = window->end;
+    }
+}
+
 static uint32_t rinha_scan_window_scalar(
     const rinha_index_t *index,
     const rinha_scan_window_t *window,
@@ -604,7 +618,6 @@ static uint32_t rinha_scan_window_scalar(
     float query12 = query[12];
     float query13 = query[13];
     uint32_t scanned = 0u;
-
     for (uint32_t block = window->candidate_block_begin; block < window->candidate_block_end; block++) {
         if (best_dist[4] < FLT_MAX) {
             float cutoff_dist = sqrtf(best_dist[4]);
@@ -618,13 +631,9 @@ static uint32_t rinha_scan_window_scalar(
             }
         }
 
-        uint32_t local_block = block - window->block_begin;
-        uint32_t item_start = window->start + local_block * RINHA_IVF_BLOCK_SIZE;
-        uint32_t item_end = item_start + RINHA_IVF_BLOCK_SIZE;
-        if (item_end > window->end) {
-            item_end = window->end;
-        }
-
+        uint32_t item_start = 0u;
+        uint32_t item_end = 0u;
+        rinha_block_item_range(window, block, &item_start, &item_end);
         scanned += item_end - item_start;
         for (uint32_t item = item_start; item < item_end; item++) {
             const rinha_vector_scalar_t *vector = vectors + (size_t) item * RINHA_DIM;
@@ -660,7 +669,6 @@ static uint32_t rinha_scan_window_avx2(
     float query12 = query[12];
     float query13 = query[13];
     uint32_t scanned = 0u;
-
     for (uint32_t block = window->candidate_block_begin; block < window->candidate_block_end; block++) {
         if (best_dist[4] < FLT_MAX) {
             float cutoff_dist = sqrtf(best_dist[4]);
@@ -674,13 +682,9 @@ static uint32_t rinha_scan_window_avx2(
             }
         }
 
-        uint32_t local_block = block - window->block_begin;
-        uint32_t item_start = window->start + local_block * RINHA_IVF_BLOCK_SIZE;
-        uint32_t item_end = item_start + RINHA_IVF_BLOCK_SIZE;
-        if (item_end > window->end) {
-            item_end = window->end;
-        }
-
+        uint32_t item_start = 0u;
+        uint32_t item_end = 0u;
+        rinha_block_item_range(window, block, &item_start, &item_end);
         scanned += item_end - item_start;
         for (uint32_t item = item_start; item < item_end; item++) {
             const rinha_vector_scalar_t *vector = vectors + (size_t) item * RINHA_DIM;
