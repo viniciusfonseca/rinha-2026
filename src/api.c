@@ -70,6 +70,7 @@ typedef struct {
     size_t read_len;
     size_t write_len;
     size_t write_sent;
+    const char *write_ptr;
     char read_buf[API_READ_BUFFER + 1];
     char write_buf[API_WRITE_BUFFER];
 } api_conn_t;
@@ -183,6 +184,7 @@ static void api_finalize_conn(api_conn_t *conn, int conn_index, int *free_slots,
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
+    conn->write_ptr = conn->write_buf;
 
     if (was_used && conn_index >= 0) {
         free_slots[(*free_count)++] = conn_index;
@@ -210,6 +212,7 @@ static int api_alloc_conn(api_conn_t *connections, int *free_slots, size_t *free
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
+    conn->write_ptr = conn->write_buf;
     return i;
 }
 
@@ -260,7 +263,7 @@ static int api_queue_send(struct io_uring *ring, api_conn_t *conn, int conn_inde
     if (sqe == NULL) {
         return -1;
     }
-    const void *buf = conn->write_buf + conn->write_sent;
+    const void *buf = conn->write_ptr + conn->write_sent;
     size_t len = conn->write_len - conn->write_sent;
 #if API_HAVE_SEND_ZC
     if (conn->zerocopy_enabled) {
@@ -345,17 +348,57 @@ static char *api_write_size(char *dst, size_t value) {
     return dst;
 }
 
-static void api_prepare_response(
+typedef struct {
+    const char *data;
+    size_t len;
+} api_static_response_t;
+
+#define API_STATIC_RESPONSE_LITERAL(literal) { literal, sizeof(literal) - 1u }
+#define API_FRAUD_RESPONSE_CLOSE(content_length, body) \
+    API_STATIC_RESPONSE_LITERAL( \
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " content_length \
+        "\r\nConnection: close\r\n\r\n" body \
+    )
+#define API_FRAUD_RESPONSE_KEEP_ALIVE(content_length, body) \
+    API_STATIC_RESPONSE_LITERAL( \
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " content_length \
+        "\r\nConnection: keep-alive\r\n\r\n" body \
+    )
+
+static const api_static_response_t API_FRAUD_RESPONSES[2][6] = {
+    {
+        API_FRAUD_RESPONSE_CLOSE("35", "{\"approved\":true,\"fraud_score\":0.0}"),
+        API_FRAUD_RESPONSE_CLOSE("35", "{\"approved\":true,\"fraud_score\":0.2}"),
+        API_FRAUD_RESPONSE_CLOSE("35", "{\"approved\":true,\"fraud_score\":0.4}"),
+        API_FRAUD_RESPONSE_CLOSE("36", "{\"approved\":false,\"fraud_score\":0.6}"),
+        API_FRAUD_RESPONSE_CLOSE("36", "{\"approved\":false,\"fraud_score\":0.8}"),
+        API_FRAUD_RESPONSE_CLOSE("36", "{\"approved\":false,\"fraud_score\":1.0}"),
+    },
+    {
+        API_FRAUD_RESPONSE_KEEP_ALIVE("35", "{\"approved\":true,\"fraud_score\":0.0}"),
+        API_FRAUD_RESPONSE_KEEP_ALIVE("35", "{\"approved\":true,\"fraud_score\":0.2}"),
+        API_FRAUD_RESPONSE_KEEP_ALIVE("35", "{\"approved\":true,\"fraud_score\":0.4}"),
+        API_FRAUD_RESPONSE_KEEP_ALIVE("36", "{\"approved\":false,\"fraud_score\":0.6}"),
+        API_FRAUD_RESPONSE_KEEP_ALIVE("36", "{\"approved\":false,\"fraud_score\":0.8}"),
+        API_FRAUD_RESPONSE_KEEP_ALIVE("36", "{\"approved\":false,\"fraud_score\":1.0}"),
+    },
+};
+
+#undef API_FRAUD_RESPONSE_KEEP_ALIVE
+#undef API_FRAUD_RESPONSE_CLOSE
+#undef API_STATIC_RESPONSE_LITERAL
+
+static void api_prepare_response_len(
     api_conn_t *conn,
     const char *status,
     const char *content_type,
     const char *body,
+    size_t body_len,
     bool keep_alive
 ) {
     const char *connection = keep_alive ? "keep-alive" : "close";
     char *p = conn->write_buf;
     char *end = conn->write_buf + sizeof(conn->write_buf);
-    size_t body_len = body == NULL ? 0u : strlen(body);
 
     p = api_copy_str(p, "HTTP/1.1 ");
     p = api_copy_str(p, status);
@@ -375,9 +418,21 @@ static void api_prepare_response(
         p += body_len;
     }
 
+    conn->write_ptr = conn->write_buf;
     conn->write_len = (size_t) (p - conn->write_buf);
     conn->write_sent = 0;
     conn->keep_alive = keep_alive;
+}
+
+static void api_prepare_response(
+    api_conn_t *conn,
+    const char *status,
+    const char *content_type,
+    const char *body,
+    bool keep_alive
+) {
+    size_t body_len = body == NULL ? 0u : strlen(body);
+    api_prepare_response_len(conn, status, content_type, body, body_len, keep_alive);
 }
 
 static void api_prepare_no_content(api_conn_t *conn, bool keep_alive) {
@@ -385,7 +440,19 @@ static void api_prepare_no_content(api_conn_t *conn, bool keep_alive) {
     p = api_copy_str(p, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: ");
     p = api_copy_str(p, keep_alive ? "keep-alive" : "close");
     p = api_copy_str(p, "\r\n\r\n");
+    conn->write_ptr = conn->write_buf;
     conn->write_len = (size_t) (p - conn->write_buf);
+    conn->write_sent = 0;
+    conn->keep_alive = keep_alive;
+}
+
+static void api_prepare_static_response(
+    api_conn_t *conn,
+    const api_static_response_t *response,
+    bool keep_alive
+) {
+    conn->write_ptr = response->data;
+    conn->write_len = response->len;
     conn->write_sent = 0;
     conn->keep_alive = keep_alive;
 }
@@ -414,19 +481,8 @@ static void api_handle_business(api_conn_t *conn, const api_request_t *request, 
     if (fraud_count == 2 && rinha_payload_force_deny_borderline(&payload)) {
         fraud_count = 3;
     }
-    float fraud_score = (float) fraud_count / 5.0f;
-    bool approved = fraud_score < 0.6f;
-
-    char body[96];
-    static const char *const score_texts[] = {"0.0", "0.2", "0.4", "0.6", "0.8", "1.0"};
-    char *p = body;
-    p = api_copy_str(p, "{\"approved\":");
-    p = api_copy_str(p, approved ? "true" : "false");
-    p = api_copy_str(p, ",\"fraud_score\":");
-    p = api_copy_str(p, score_texts[fraud_count]);
-    p = api_copy_str(p, "}");
-    *p = '\0';
-    api_prepare_response(conn, "200 OK", "application/json", body, request->keep_alive);
+    const api_static_response_t *response = &API_FRAUD_RESPONSES[request->keep_alive ? 1u : 0u][fraud_count];
+    api_prepare_static_response(conn, response, request->keep_alive);
 }
 
 static int api_finish_response(
@@ -451,6 +507,7 @@ static int api_finish_response(
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
+    conn->write_ptr = conn->write_buf;
     return api_queue_recv(ring, conn, conn_index);
 }
 
