@@ -58,6 +58,8 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Estado atual importante:
     - `RINHA_IVF_NLIST = 2048`
     - `RINHA_IVF_NPROBE = 4`
+    - `RINHA_IVF_ADAPTIVE_MIN_PROBES = 3`
+    - `RINHA_IVF_ADAPTIVE_PROBE_RATIO = 0.75`
     - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
     - `RINHA_IVF_BLOCK_SIZE = 64`
@@ -177,6 +179,39 @@ Importante:
     - `plan` sobe porque ha mais centroides
     - mesmo assim o ganho e liquido, porque o volume escaneado nas `probe lists` cai muito e o `probe_scan` praticamente cai pela metade
   - no `k6` curto apos aquecimento, `http_req_duration` medio caiu para ~`1.64ms`
+  - teste posterior com `NPROBE` adaptativo manteve `RINHA_IVF_NPROBE = 4` como teto, mas passou a pular a 4a probe list quando o cutoff do `top-5` ja fica suficientemente apertado depois das 3 primeiras
+  - no profiler do indice, isso apareceu como:
+    - `avg_probe_scanned = 3.00`
+    - `avg_probe_skipped_adaptive = 1.00`
+  - comparando com o baseline `NLIST=2048` fixo em 4 probes:
+    - baseline aquecido:
+      - `avg_total_us ~51.09 / 50.45`
+      - `avg_probe_scan_us ~21.80 / 21.91`
+      - `avg_vectors_probe = 3452`
+      - `avg_vectors_candidate = 984`
+    - adaptativo aquecido:
+      - `avg_total_us ~48.54 / 50.54`
+      - `avg_probe_scan_us ~20.07 / 21.37`
+      - `avg_vectors_probe = 3271`
+      - `avg_vectors_candidate = 1165`
+  - leitura pratica:
+    - o ganho no indice foi pequeno, mas positivo em media
+    - o custo de probe caiu, parte do trabalho migrou para candidate scan, e o volume total de vetores consultados ficou praticamente empatado
+    - no `k6` curto aquecido, a latencia media ficou na faixa de `~1.62ms`
+  - melhoria posterior em `candidate_lists` removeu o `append + qsort` e passou a manter a lista ordenada por insercao durante a montagem
+  - no profiler do indice, isso derrubou `avg_candidate_sort_us` de ~`0.86/0.91` para ~`0.02/0.02`
+  - comparando o baseline adaptativo anterior com a versao atual, em `400` calls aquecidas:
+    - antes:
+      - `api1`: `avg_total_us=48.54`, `avg_probe_scan_us=20.07`, `avg_candidate_build_us=3.69`, `avg_candidate_sort_us=0.86`
+      - `api2`: `avg_total_us=50.54`, `avg_probe_scan_us=21.37`, `avg_candidate_build_us=3.79`, `avg_candidate_sort_us=0.91`
+    - depois:
+      - `api1`: `avg_total_us=47.61`, `avg_probe_scan_us=19.69`, `avg_candidate_build_us=4.15`, `avg_candidate_sort_us=0.02`
+      - `api2`: `avg_total_us=46.01`, `avg_probe_scan_us=18.67`, `avg_candidate_build_us=4.31`, `avg_candidate_sort_us=0.02`
+  - leitura pratica:
+    - o custo de ordenacao praticamente sumiu
+    - parte desse ganho migrou para `candidate_build`, como esperado
+    - mesmo assim o tempo total da busca caiu de forma liquida no profiler do indice
+    - no `k6` curto local a latencia fim a fim continuou ruidosa entre rodadas, entao a referencia mais confiavel para essa mudanca foi o profiler interno do indice
 
 ## Telemetria do Load Balancer
 

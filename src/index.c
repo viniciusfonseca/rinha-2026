@@ -48,6 +48,7 @@ typedef struct {
     uint64_t probe_lists_total;
     uint64_t probe_lists_scanned;
     uint64_t probe_lists_pruned_bound;
+    uint64_t probe_lists_skipped_adaptive;
     uint64_t candidate_lists_considered;
     uint64_t candidate_lists_selected;
     uint64_t candidate_lists_scanned;
@@ -123,7 +124,7 @@ static void rinha_index_profile_report(const char *reason) {
         "[index-prof] reason=%s calls=%" PRIu64
         " avg_total_us=%.2f avg_plan_us=%.2f avg_probe_scan_us=%.2f"
         " avg_candidate_build_us=%.2f avg_candidate_sort_us=%.2f avg_candidate_scan_us=%.2f"
-        " avg_probe_lists=%.2f avg_probe_scanned=%.2f avg_probe_pruned_bound=%.2f"
+        " avg_probe_lists=%.2f avg_probe_scanned=%.2f avg_probe_pruned_bound=%.2f avg_probe_skipped_adaptive=%.2f"
         " avg_candidate_considered=%.2f avg_candidate_selected=%.2f avg_candidate_scanned=%.2f"
         " avg_candidate_pruned_radius=%.2f avg_candidate_pruned_bound=%.2f avg_candidate_skipped_after_sort=%.2f"
         " avg_vectors_probe=%.2f avg_vectors_candidate=%.2f avg_vectors_total=%.2f\n",
@@ -138,6 +139,7 @@ static void rinha_index_profile_report(const char *reason) {
         (double) rinha_index_profile.probe_lists_total / calls,
         (double) rinha_index_profile.probe_lists_scanned / calls,
         (double) rinha_index_profile.probe_lists_pruned_bound / calls,
+        (double) rinha_index_profile.probe_lists_skipped_adaptive / calls,
         (double) rinha_index_profile.candidate_lists_considered / calls,
         (double) rinha_index_profile.candidate_lists_selected / calls,
         (double) rinha_index_profile.candidate_lists_scanned / calls,
@@ -319,6 +321,7 @@ static float rinha_distance_sq_float_avx2(const float *lhs, const float *rhs) {
     __m256 sum1 = _mm256_mul_ps(diff1, diff1);
     return rinha_reduce_m256(sum0) + rinha_reduce_m256(sum1);
 }
+
 #endif
 
 static float rinha_distance_sq_float(const float *lhs, const float *rhs, size_t dim) {
@@ -416,12 +419,18 @@ static void rinha_insert_probe_list(rinha_list_bound_t bounds[RINHA_IVF_NPROBE],
 }
 
 static void rinha_insert_candidate_list(
-    rinha_list_candidate_t *candidate,
+    rinha_list_candidate_t *candidates,
+    size_t count,
     float lower_bound_sq,
     uint32_t list
 ) {
-    candidate->lower_bound_sq = lower_bound_sq;
-    candidate->list = list;
+    size_t slot = count;
+    while (slot > 0u && lower_bound_sq < candidates[slot - 1u].lower_bound_sq) {
+        candidates[slot] = candidates[slot - 1u];
+        slot--;
+    }
+    candidates[slot].lower_bound_sq = lower_bound_sq;
+    candidates[slot].list = list;
 }
 
 static float rinha_list_lower_bound_sq_for_distance(float centroid_dist, float radius) {
@@ -434,18 +443,6 @@ static float rinha_list_lower_bound_sq_for_distance(float centroid_dist, float r
 
 static float rinha_list_lower_bound_sq(float centroid_dist_sq, float radius) {
     return rinha_list_lower_bound_sq_for_distance(sqrtf(centroid_dist_sq), radius);
-}
-
-static int rinha_compare_candidate_lists(const void *lhs_ptr, const void *rhs_ptr) {
-    const rinha_list_candidate_t *lhs = (const rinha_list_candidate_t *) lhs_ptr;
-    const rinha_list_candidate_t *rhs = (const rinha_list_candidate_t *) rhs_ptr;
-    if (lhs->lower_bound_sq < rhs->lower_bound_sq) {
-        return -1;
-    }
-    if (lhs->lower_bound_sq > rhs->lower_bound_sq) {
-        return 1;
-    }
-    return 0;
 }
 
 static size_t rinha_plan_probe_lists(
@@ -702,6 +699,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     uint64_t candidate_scan_ns = 0u;
     uint64_t probe_lists_scanned = 0u;
     uint64_t probe_lists_pruned_bound = 0u;
+    uint64_t probe_lists_skipped_adaptive = 0u;
     uint64_t candidate_lists_considered = 0u;
     uint64_t candidate_lists_selected = 0u;
     uint64_t candidate_lists_scanned = 0u;
@@ -735,6 +733,12 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     uint8_t best_label[5] = {0u, 0u, 0u, 0u, 0u};
 
     for (size_t i = 0; i < probe_count; i++) {
+        if (i >= RINHA_IVF_ADAPTIVE_MIN_PROBES &&
+            best_dist[4] < FLT_MAX &&
+            best_dist[4] <= probe_lists[i].centroid_dist_sq * RINHA_IVF_ADAPTIVE_PROBE_RATIO) {
+            probe_lists_skipped_adaptive += probe_count - i;
+            break;
+        }
         uint32_t list = probe_lists[i].list;
         selected_lists[list] = true;
         float centroid_dist = sqrtf(probe_lists[i].centroid_dist_sq);
@@ -770,16 +774,13 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
             candidate_lists_pruned_bound++;
             continue;
         }
-        rinha_insert_candidate_list(&candidate_lists[candidate_count++], lower_bound_sq, list);
+        rinha_insert_candidate_list(candidate_lists, candidate_count, lower_bound_sq, list);
+        candidate_count++;
         candidate_lists_selected++;
     }
     if (profile_enabled) {
         candidate_build_ns = rinha_now_ns() - phase_start_ns;
         phase_start_ns = rinha_now_ns();
-    }
-
-    if (candidate_count > 1u) {
-        qsort(candidate_lists, candidate_count, sizeof(candidate_lists[0]), rinha_compare_candidate_lists);
     }
     if (profile_enabled) {
         candidate_sort_ns = rinha_now_ns() - phase_start_ns;
@@ -816,6 +817,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         rinha_index_profile.probe_lists_total += probe_count;
         rinha_index_profile.probe_lists_scanned += probe_lists_scanned;
         rinha_index_profile.probe_lists_pruned_bound += probe_lists_pruned_bound;
+        rinha_index_profile.probe_lists_skipped_adaptive += probe_lists_skipped_adaptive;
         rinha_index_profile.candidate_lists_considered += candidate_lists_considered;
         rinha_index_profile.candidate_lists_selected += candidate_lists_selected;
         rinha_index_profile.candidate_lists_scanned += candidate_lists_scanned;
