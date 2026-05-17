@@ -1,5 +1,5 @@
 x-api: &api
-  image: distanteagle16/rinha-2026:v3
+  image: distanteagle16/rinha-2026:v6
   platform: linux/amd64
   command: ["/usr/local/bin/fraud_api"]
   environment:
@@ -22,13 +22,14 @@ x-api: &api
 
 services:
   lb:
-    image: distanteagle16/rinha-2026:v3
+    image: distanteagle16/rinha-2026:v6
     platform: linux/amd64
     command: ["/usr/local/bin/fraud_lb"]
     environment:
       BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
       RINHA_LB_PROFILE: ${RINHA_LB_PROFILE:-}
       RINHA_LB_PROFILE_EVERY: ${RINHA_LB_PROFILE_EVERY:-}
+      RINHA_LB_BACKEND_POOL_SIZE: ${RINHA_LB_BACKEND_POOL_SIZE:-16}
     ports:
       - "9999:9999"
     depends_on:
