@@ -475,7 +475,10 @@ static int api_finish_response(
     conn->write_len = 0;
     conn->write_sent = 0;
     conn->write_ptr = conn->write_buf;
-    return api_queue_recv(ring, conn, conn_index);
+    if (api_queue_recv(ring, conn, conn_index) < 0) {
+        return -1;
+    }
+    return 1;
 }
 
 static bool api_send_zc_should_fallback(bool used_zerocopy, int res) {

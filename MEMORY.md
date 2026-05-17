@@ -56,7 +56,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/common.h](./src/common.h)
   - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
-    - `RINHA_IVF_NLIST = 1024`
+    - `RINHA_IVF_NLIST = 2048`
     - `RINHA_IVF_NPROBE = 4`
     - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
@@ -160,6 +160,23 @@ Importante:
   - em `linux/arm64/v8` no Mac, a ordem de acumulacao do kernel escalar em `rinha_distance_sq_scalar_preloaded` importa bastante para o `early-exit`
   - comparacao A/B em regime aquecido (`~200` calls por API) mostrou que a ordem reordenada derrubou o `probe_scan` de ~`82.95us`-`94.91us` para ~`60.06us`-`64.90us`, mantendo ~`8085` vetores nas probe lists
   - a mesma mudanca tambem reduziu `candidate_scan` de ~`21.17us`-`24.50us` para ~`14.06us`-`15.57us`
+  - ajuste posterior de tuning para `RINHA_IVF_NLIST = 2048` reduziu fortemente o gargalo atual de `probe_scan`
+  - baseline anterior com `NLIST=1024`, em rodada curta aquecida, estava em:
+    - `avg_total_us ~66.14` / `67.88`
+    - `avg_probe_scan_us ~45.96` / `49.63`
+    - `avg_vectors_probe = 8085`
+    - `avg_vectors_total = 9391`
+  - apos `NLIST=2048`, na mesma carga curta e em segunda rodada aquecida, ficou em:
+    - `avg_total_us ~51.09` / `50.45`
+    - `avg_plan_us ~18.44` / `17.48`
+    - `avg_probe_scan_us ~21.80` / `21.91`
+    - `avg_vectors_probe = 3452`
+    - `avg_vectors_candidate = 984`
+    - `avg_vectors_total = 4436`
+  - leitura pratica:
+    - `plan` sobe porque ha mais centroides
+    - mesmo assim o ganho e liquido, porque o volume escaneado nas `probe lists` cai muito e o `probe_scan` praticamente cai pela metade
+  - no `k6` curto apos aquecimento, `http_req_duration` medio caiu para ~`1.64ms`
 
 ## Telemetria do Load Balancer
 
@@ -186,6 +203,18 @@ Importante:
   - nesse cenario com keep-alive, o `LB` nao apareceu gargalando em `connect` nem em `write`
   - o tempo dominante visto pelo `LB` e espera por dados (`read`), principalmente do backend
   - isso sugere que o gargalo observado em carga curta estava mais em espera pelo processamento/resposta da API do que em custo interno do `LB`
+- Atualizacao operacional importante:
+  - o `LB` voltou a usar pool de conexoes backend por padrao
+  - `RINHA_LB_BACKEND_POOL_SIZE` agora assume `16` no codigo e no `docker-compose.yml`
+  - o pool e pre-preenchido no bootstrap; em cenario estavel, o profiler mostrou `pool_connect_ops=32`, `connect_ops=0`, `pool_hits=6`, `pool_misses=0` e `pool_returns=5` numa sequencia curta de requests validas
+  - novos contadores uteis no profiler: `pool_return_attempts`, `pool_return_skipped_no_keepalive` e `pool_return_skipped_no_slot`
+- Causa raiz da instabilidade do reuse entre sessoes:
+  - o problema nao estava no pool em si, e sim no keep-alive da API sobre unix socket
+  - em `src/api.c`, `api_finish_response()` enfileirava o proximo `recv`, mas retornava `0` em caso de sucesso
+  - o loop principal da API so chamava `io_uring_submit()` quando `finish_rc > 0`, entao o novo `recv` ficava pendente sem submit e a conexao reutilizada travava ate outro evento acordar o loop
+  - correcao aplicada: `api_finish_response()` agora retorna `1` quando consegue enfileirar o novo `recv`
+  - validacao direta: duas requests sequenciais no mesmo `/run/rinha/api1.sock` com `Connection: keep-alive` passaram com `200` nas duas respostas
+  - validacao fim a fim: com o pool ligado, uma sequencia de 6 `POST /fraud-score` com `Connection: close` voltou `200` em todas
 
 ## Compose e Ambientes
 

@@ -28,7 +28,7 @@
 #define LB_MAX_SESSIONS 1024
 #define LB_BUFFER_SIZE 4096
 #define LB_MAX_BACKENDS 8
-#define LB_BACKEND_POOL_SIZE_DEFAULT 0
+#define LB_BACKEND_POOL_SIZE_DEFAULT 16
 #define LB_BACKEND_POOL_SIZE_MAX 64
 #define LB_CQE_BATCH 64
 #define LB_SEND_FLAGS MSG_NOSIGNAL
@@ -150,6 +150,11 @@ typedef struct {
     uint64_t pool_connect_ns;
     uint64_t pool_hits;
     uint64_t pool_misses;
+    uint64_t pool_return_attempts;
+    uint64_t pool_returns;
+    uint64_t pool_stale_discards;
+    uint64_t pool_return_skipped_no_keepalive;
+    uint64_t pool_return_skipped_no_slot;
     uint64_t read_ops[2];
     uint64_t read_failures[2];
     uint64_t read_eof[2];
@@ -265,6 +270,10 @@ static void lb_profile_report(const char *reason) {
         " connect_ops=%" PRIu64 " avg_connect_us=%.2f connect_failures=%" PRIu64
         " pool_connect_ops=%" PRIu64 " avg_pool_connect_us=%.2f pool_connect_failures=%" PRIu64
         " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
+        " pool_return_attempts=%" PRIu64
+        " pool_returns=%" PRIu64 " pool_stale_discards=%" PRIu64
+        " pool_return_skipped_no_keepalive=%" PRIu64
+        " pool_return_skipped_no_slot=%" PRIu64
         " avg_read_client_us=%.2f avg_read_backend_us=%.2f"
         " avg_write_backend_us=%.2f avg_write_client_us=%.2f"
         " avg_wait_us=%.2f avg_cqes_per_wait=%.2f avg_sqes_per_submit=%.2f"
@@ -294,6 +303,11 @@ static void lb_profile_report(const char *reason) {
         lb_profile.pool_connect_failures,
         lb_profile.pool_hits,
         lb_profile.pool_misses,
+        lb_profile.pool_return_attempts,
+        lb_profile.pool_returns,
+        lb_profile.pool_stale_discards,
+        lb_profile.pool_return_skipped_no_keepalive,
+        lb_profile.pool_return_skipped_no_slot,
         lb_avg_us(lb_profile.read_ns[0], lb_profile.read_ops[0]),
         lb_avg_us(lb_profile.read_ns[1], lb_profile.read_ops[1]),
         lb_avg_us(lb_profile.write_ns[0], lb_profile.write_ops[0]),
@@ -802,6 +816,9 @@ static bool lb_try_acquire_backend_from_pool(lb_backend_pool_t *pool, lb_session
             slot->pending = false;
             slot->zerocopy_enabled = false;
             slot->connect_started_ns = 0u;
+            if (lb_profile.enabled) {
+                lb_profile.pool_stale_discards++;
+            }
             if (pool->ready_count > 0u) {
                 pool->ready_count--;
             }
@@ -829,6 +846,9 @@ static bool lb_return_backend_to_pool(lb_backend_pool_t *pool, int fd, bool zero
     if (fd < 0 || pool->target_size == 0u) {
         return false;
     }
+    if (lb_profile.enabled) {
+        lb_profile.pool_return_attempts++;
+    }
 
     size_t total = 0u;
     for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
@@ -837,6 +857,9 @@ static bool lb_return_backend_to_pool(lb_backend_pool_t *pool, int fd, bool zero
         }
     }
     if (total >= pool->target_size) {
+        if (lb_profile.enabled) {
+            lb_profile.pool_return_skipped_no_slot++;
+        }
         return false;
     }
 
@@ -851,6 +874,9 @@ static bool lb_return_backend_to_pool(lb_backend_pool_t *pool, int fd, bool zero
         slot->zerocopy_enabled = zerocopy_enabled;
         slot->connect_started_ns = 0u;
         pool->ready_count++;
+        if (lb_profile.enabled) {
+            lb_profile.pool_returns++;
+        }
         return true;
     }
 
@@ -1041,8 +1067,15 @@ static bool lb_release_backend_after_response(lb_session_t *session, lb_backend_
     session->zerocopy_enabled[0] = false;
     session->backend_keep_alive = false;
 
-    if (backend_keep_alive
-        && lb_return_backend_to_pool(&backend_pools[session->backend_index], backend_fd, zerocopy_enabled)) {
+    if (!backend_keep_alive) {
+        if (lb_profile.enabled) {
+            lb_profile.pool_return_skipped_no_keepalive++;
+        }
+    } else if (lb_return_backend_to_pool(
+            &backend_pools[session->backend_index],
+            backend_fd,
+            zerocopy_enabled
+        )) {
         session->backend_index = -1;
         return false;
     }
@@ -1293,6 +1326,27 @@ int main(void) {
     lb_backend_pool_t backend_pools[LB_MAX_BACKENDS];
     for (size_t i = 0; i < backend_count; i++) {
         lb_backend_pool_init(&backend_pools[i], backend_pool_size);
+        int fill_rc = lb_fill_backend_pool(&ring, &backend_pools[i], (int) i, &backends[i]);
+        if (fill_rc == 1) {
+            fprintf(stderr, "falha ao abrir socket para preencher o pool do backend %zu\n", i);
+            for (size_t j = 0; j <= i; j++) {
+                lb_backend_pool_close(&backend_pools[j]);
+            }
+            free(sessions);
+            io_uring_queue_exit(&ring);
+            close(listen_fd);
+            return 1;
+        }
+        if (fill_rc == 2) {
+            fprintf(stderr, "falha ao enfileirar connect para preencher o pool do backend %zu\n", i);
+            for (size_t j = 0; j <= i; j++) {
+                lb_backend_pool_close(&backend_pools[j]);
+            }
+            free(sessions);
+            io_uring_queue_exit(&ring);
+            close(listen_fd);
+            return 1;
+        }
     }
 
     lb_accept_state_t accept_state;

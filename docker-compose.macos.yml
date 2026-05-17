@@ -4,21 +4,21 @@ services:
     privileged: true
     cap_add:
       - SYS_ADMIN
-    environment:
-      RINHA_DISABLE_SEND_ZC: "1"
+    # environment:
+    #   RINHA_DISABLE_SEND_ZC: "1"
 
   api1:
     platform: linux/arm64/v8
     privileged: true
     cap_add:
       - SYS_ADMIN
-    environment:
-      RINHA_DISABLE_SEND_ZC: "1"
+    # environment:
+    #   RINHA_DISABLE_SEND_ZC: "1"
 
   api2:
     platform: linux/arm64/v8
     privileged: true
     cap_add:
       - SYS_ADMIN
-    environment:
-      RINHA_DISABLE_SEND_ZC: "1"
+    # environment:
+    #   RINHA_DISABLE_SEND_ZC: "1"
