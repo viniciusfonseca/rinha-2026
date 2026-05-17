@@ -338,10 +338,7 @@ int main(int argc, char **argv) {
 
         rinha_vector_scalar_t *vector = vectors + (size_t) count * RINHA_DIM;
         for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-            vector[dim] = rinha_quantize_scalar(0.0);
-        }
-        for (size_t dim = 0; dim < RINHA_FEATURE_DIM; dim++) {
-            vector[rinha_feature_layout_inverse[dim]] = rinha_quantize_scalar(rinha_reader_number(&reader));
+            vector[dim] = rinha_quantize_scalar(rinha_reader_number(&reader));
         }
 
         if (rinha_reader_skip_to(&reader, ':') == EOF || rinha_reader_string(&reader, label_text, sizeof(label_text)) != 0) {

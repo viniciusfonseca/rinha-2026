@@ -28,8 +28,6 @@
 #define LB_MAX_SESSIONS 1024
 #define LB_BUFFER_SIZE 4096
 #define LB_MAX_BACKENDS 8
-#define LB_BACKEND_POOL_SIZE_DEFAULT 16
-#define LB_BACKEND_POOL_SIZE_MAX 64
 #define LB_CQE_BATCH 64
 #define LB_SEND_FLAGS MSG_NOSIGNAL
 
@@ -56,16 +54,7 @@ typedef enum {
     LB_OP_CONNECT = 2,
     LB_OP_READ = 3,
     LB_OP_WRITE = 4,
-    LB_OP_POOL_CONNECT = 5,
 } lb_op_type_t;
-
-typedef enum {
-    LB_PHASE_READING_REQUEST = 1,
-    LB_PHASE_CONNECTING_BACKEND = 2,
-    LB_PHASE_WRITING_REQUEST = 3,
-    LB_PHASE_READING_RESPONSE = 4,
-    LB_PHASE_WRITING_RESPONSE = 5,
-} lb_phase_t;
 
 typedef struct {
     struct sockaddr_storage addr;
@@ -79,37 +68,14 @@ typedef struct {
 } lb_backend_t;
 
 typedef struct {
-    int fd;
-    bool ready;
-    bool pending;
-    bool zerocopy_enabled;
-    uint64_t connect_started_ns;
-} lb_backend_pool_slot_t;
-
-typedef struct {
-    lb_backend_pool_slot_t slots[LB_BACKEND_POOL_SIZE_MAX];
-    size_t target_size;
-    size_t ready_count;
-} lb_backend_pool_t;
-
-typedef struct {
-    size_t total_length;
-    bool keep_alive;
-} lb_http_message_t;
-
-typedef struct {
     int client_fd;
     int backend_fd;
     bool used;
     bool connected;
-    bool client_keep_alive;
-    bool backend_keep_alive;
     bool zerocopy_enabled[2];
     bool send_inflight_zerocopy[2];
     bool send_complete_waiting_notif[2];
     bool close_pending;
-    lb_phase_t phase;
-    int backend_index;
     uint32_t generation;
     unsigned inflight_ops;
     unsigned pending_send_notifs[2];
@@ -145,11 +111,6 @@ typedef struct {
     uint64_t connect_ops;
     uint64_t connect_failures;
     uint64_t connect_ns;
-    uint64_t pool_connect_ops;
-    uint64_t pool_connect_failures;
-    uint64_t pool_connect_ns;
-    uint64_t pool_hits;
-    uint64_t pool_misses;
     uint64_t read_ops[2];
     uint64_t read_failures[2];
     uint64_t read_eof[2];
@@ -208,23 +169,6 @@ static uint64_t lb_env_u64(const char *name, uint64_t fallback) {
     return (uint64_t) parsed;
 }
 
-static size_t lb_env_size(const char *name, size_t fallback, size_t max_value) {
-    const char *value = getenv(name);
-    if (value == NULL || value[0] == '\0') {
-        return fallback;
-    }
-
-    char *end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return fallback;
-    }
-    if (parsed > (unsigned long long) max_value) {
-        return max_value;
-    }
-    return (size_t) parsed;
-}
-
 static uint64_t lb_now_ns(void) {
     struct timespec ts;
 #ifdef CLOCK_MONOTONIC_RAW
@@ -262,9 +206,7 @@ static void lb_profile_report(const char *reason) {
         " alloc_failures=%" PRIu64
         " avg_session_ms=%.2f"
         " avg_accept_us=%.2f accept_failures=%" PRIu64
-        " connect_ops=%" PRIu64 " avg_connect_us=%.2f connect_failures=%" PRIu64
-        " pool_connect_ops=%" PRIu64 " avg_pool_connect_us=%.2f pool_connect_failures=%" PRIu64
-        " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
+        " avg_connect_us=%.2f connect_failures=%" PRIu64
         " avg_read_client_us=%.2f avg_read_backend_us=%.2f"
         " avg_write_backend_us=%.2f avg_write_client_us=%.2f"
         " avg_wait_us=%.2f avg_cqes_per_wait=%.2f avg_sqes_per_submit=%.2f"
@@ -286,14 +228,8 @@ static void lb_profile_report(const char *reason) {
         lb_avg_count(lb_profile.session_lifetime_ns, lb_profile.sessions_closed) / 1000000.0,
         lb_avg_us(lb_profile.accept_ns, lb_profile.accept_ops),
         lb_profile.accept_failures,
-        lb_profile.connect_ops,
         lb_avg_us(lb_profile.connect_ns, lb_profile.connect_ops),
         lb_profile.connect_failures,
-        lb_profile.pool_connect_ops,
-        lb_avg_us(lb_profile.pool_connect_ns, lb_profile.pool_connect_ops),
-        lb_profile.pool_connect_failures,
-        lb_profile.pool_hits,
-        lb_profile.pool_misses,
         lb_avg_us(lb_profile.read_ns[0], lb_profile.read_ops[0]),
         lb_avg_us(lb_profile.read_ns[1], lb_profile.read_ops[1]),
         lb_avg_us(lb_profile.write_ns[0], lb_profile.write_ops[0]),
@@ -349,199 +285,6 @@ static int lb_set_nonblocking(int fd) {
         return -1;
     }
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static bool lb_ascii_ieq(const char *a, const char *b, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ca = (unsigned char) a[i];
-        unsigned char cb = (unsigned char) b[i];
-        if (ca >= 'A' && ca <= 'Z') {
-            ca = (unsigned char) (ca - 'A' + 'a');
-        }
-        if (cb >= 'A' && cb <= 'Z') {
-            cb = (unsigned char) (cb - 'A' + 'a');
-        }
-        if (ca != cb) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static int lb_parse_http_message(const char *buffer, size_t len, lb_http_message_t *message) {
-    const char *limit = buffer + len;
-    const char *header_end = NULL;
-    for (const char *p = buffer; p + 3 < limit; p++) {
-        if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
-            header_end = p;
-            break;
-        }
-    }
-    if (header_end == NULL) {
-        return 0;
-    }
-
-    const char *line_end = NULL;
-    for (const char *p = buffer; p + 1 < header_end; p++) {
-        if (p[0] == '\r' && p[1] == '\n') {
-            line_end = p;
-            break;
-        }
-    }
-    if (line_end == NULL) {
-        return -1;
-    }
-
-    message->keep_alive = true;
-    size_t content_length = 0u;
-
-    const char *cursor = line_end + 2;
-    const char *headers_limit = header_end + 2;
-    while (cursor < header_end) {
-        const char *next = cursor;
-        while (next + 1 < headers_limit && !(next[0] == '\r' && next[1] == '\n')) {
-            next++;
-        }
-        if (next + 1 >= headers_limit || next[0] != '\r' || next[1] != '\n') {
-            return -1;
-        }
-
-        size_t header_len = (size_t) (next - cursor);
-        if (header_len >= 15u && lb_ascii_ieq(cursor, "Content-Length:", 15u)) {
-            const char *value = cursor + 15;
-            while (value < next && (*value == ' ' || *value == '\t')) {
-                value++;
-            }
-            content_length = 0u;
-            while (value < next && *value >= '0' && *value <= '9') {
-                content_length = content_length * 10u + (size_t) (*value - '0');
-                value++;
-            }
-            if (value != next) {
-                return -1;
-            }
-        } else if (header_len >= 11u && lb_ascii_ieq(cursor, "Connection:", 11u)) {
-            const char *value = cursor + 11;
-            while (value < next && (*value == ' ' || *value == '\t')) {
-                value++;
-            }
-            size_t value_len = (size_t) (next - value);
-            if (value_len == 5u && lb_ascii_ieq(value, "close", 5u)) {
-                message->keep_alive = false;
-            }
-        }
-
-        cursor = next + 2;
-    }
-
-    message->total_length = (size_t) ((header_end + 4) - buffer) + content_length;
-    if (len < message->total_length) {
-        return 0;
-    }
-    return 1;
-}
-
-static bool lb_rewrite_connection_header(
-    char *buffer,
-    size_t cap,
-    size_t len,
-    bool keep_alive,
-    size_t *rewritten_len
-) {
-    char rewritten[LB_BUFFER_SIZE];
-    const char *limit = buffer + len;
-    const char *header_end = NULL;
-    for (const char *p = buffer; p + 3 < limit; p++) {
-        if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
-            header_end = p;
-            break;
-        }
-    }
-    if (header_end == NULL) {
-        return false;
-    }
-
-    const char *line_end = NULL;
-    for (const char *p = buffer; p + 1 < header_end; p++) {
-        if (p[0] == '\r' && p[1] == '\n') {
-            line_end = p;
-            break;
-        }
-    }
-    if (line_end == NULL) {
-        return false;
-    }
-
-    char *out = rewritten;
-    char *out_end = rewritten + cap;
-
-    size_t first_line_len = (size_t) ((line_end + 2) - buffer);
-    if (out + first_line_len > out_end) {
-        return false;
-    }
-    memcpy(out, buffer, first_line_len);
-    out += first_line_len;
-
-    const char *cursor = line_end + 2;
-    while (cursor < header_end) {
-        const char *next = cursor;
-        while (next + 1 < header_end + 2 && !(next[0] == '\r' && next[1] == '\n')) {
-            next++;
-        }
-        if (next + 1 >= header_end + 2 || next[0] != '\r' || next[1] != '\n') {
-            return false;
-        }
-
-        size_t header_len = (size_t) (next - cursor);
-        bool is_connection = header_len >= 11u && lb_ascii_ieq(cursor, "Connection:", 11u);
-        if (!is_connection) {
-            size_t copy_len = header_len + 2u;
-            if (out + copy_len > out_end) {
-                return false;
-            }
-            memcpy(out, cursor, copy_len);
-            out += copy_len;
-        }
-        cursor = next + 2;
-    }
-
-    const char *connection_value = keep_alive ? "keep-alive" : "close";
-    size_t connection_len = strlen(connection_value);
-    const char *connection_prefix = "Connection: ";
-    size_t connection_prefix_len = strlen(connection_prefix);
-    if (out + connection_prefix_len + connection_len + 4u > out_end) {
-        return false;
-    }
-    memcpy(out, connection_prefix, connection_prefix_len);
-    out += connection_prefix_len;
-    memcpy(out, connection_value, connection_len);
-    out += connection_len;
-    memcpy(out, "\r\n\r\n", 4u);
-    out += 4u;
-
-    const char *body = header_end + 4;
-    size_t body_len = (size_t) (limit - body);
-    if (out + body_len > out_end) {
-        return false;
-    }
-    memcpy(out, body, body_len);
-    out += body_len;
-
-    *rewritten_len = (size_t) (out - rewritten);
-    memcpy(buffer, rewritten, *rewritten_len);
-    return true;
-}
-
-static int lb_open_backend_socket(const lb_backend_t *backend) {
-    int fd = socket(((const struct sockaddr *) &backend->addr)->sa_family, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
-    }
-    if (lb_set_nonblocking(fd) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
 }
 
 static int lb_open_listener(uint16_t port) {
@@ -628,7 +371,6 @@ static void lb_finalize_session(lb_session_t *session) {
     memset(session, 0, sizeof(*session));
     session->client_fd = -1;
     session->backend_fd = -1;
-    session->backend_index = -1;
     session->generation = generation;
 }
 
@@ -640,10 +382,6 @@ static int lb_alloc_session(lb_session_t *sessions) {
             sessions[i].used = true;
             sessions[i].client_fd = -1;
             sessions[i].backend_fd = -1;
-            sessions[i].backend_index = -1;
-            sessions[i].phase = LB_PHASE_READING_REQUEST;
-            sessions[i].client_keep_alive = true;
-            sessions[i].backend_keep_alive = false;
             sessions[i].generation = next_generation == 0u ? 1u : next_generation;
             if (lb_profile.enabled) {
                 lb_profile.sessions_opened++;
@@ -671,173 +409,6 @@ static void lb_request_close(lb_session_t *session) {
         session->backend_fd = -1;
     }
     session->connected = false;
-    session->backend_index = -1;
-    session->close_pending = true;
-}
-
-static void lb_backend_pool_init(lb_backend_pool_t *pool, size_t target_size) {
-    memset(pool, 0, sizeof(*pool));
-    pool->target_size = target_size;
-    for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
-        pool->slots[i].fd = -1;
-    }
-}
-
-static void lb_backend_pool_close(lb_backend_pool_t *pool) {
-    for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
-        if (pool->slots[i].fd >= 0) {
-            close(pool->slots[i].fd);
-            pool->slots[i].fd = -1;
-        }
-        pool->slots[i].ready = false;
-        pool->slots[i].pending = false;
-        pool->slots[i].zerocopy_enabled = false;
-        pool->slots[i].connect_started_ns = 0u;
-    }
-    pool->ready_count = 0u;
-}
-
-static int lb_queue_pool_connect(
-    struct io_uring *ring,
-    lb_backend_pool_t *pool,
-    int backend_index,
-    int slot_index,
-    const lb_backend_t *backend
-) {
-    lb_backend_pool_slot_t *slot = &pool->slots[slot_index];
-    if (slot->ready || slot->pending) {
-        return 0;
-    }
-
-    int fd = lb_open_backend_socket(backend);
-    if (fd < 0) {
-        return 1;
-    }
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (sqe == NULL) {
-        close(fd);
-        return 2;
-    }
-
-    slot->fd = fd;
-    slot->ready = false;
-    slot->pending = true;
-    slot->zerocopy_enabled = lb_try_enable_zerocopy(fd);
-    slot->connect_started_ns = lb_profile.enabled ? lb_now_ns() : 0u;
-    io_uring_prep_connect(sqe, fd, (const struct sockaddr *) &backend->addr, backend->addr_len);
-    io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_POOL_CONNECT, backend_index, slot_index, 0));
-    return 0;
-}
-
-static int lb_fill_backend_pool(
-    struct io_uring *ring,
-    lb_backend_pool_t *pool,
-    int backend_index,
-    const lb_backend_t *backend
-) {
-    if (pool->target_size == 0u) {
-        return 0;
-    }
-
-    size_t total = 0u;
-    for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
-        if (pool->slots[i].ready || pool->slots[i].pending) {
-            total++;
-        }
-    }
-
-    while (total < pool->target_size) {
-        bool queued = false;
-        for (int slot_index = 0; slot_index < (int) LB_BACKEND_POOL_SIZE_MAX; slot_index++) {
-            lb_backend_pool_slot_t *slot = &pool->slots[slot_index];
-            if (slot->ready || slot->pending || slot->fd >= 0) {
-                continue;
-            }
-            int rc = lb_queue_pool_connect(ring, pool, backend_index, slot_index, backend);
-            if (rc == 1) {
-                return 1;
-            }
-            if (rc == 2) {
-                return 2;
-            }
-            total++;
-            queued = true;
-            break;
-        }
-        if (!queued) {
-            break;
-        }
-    }
-
-    return 0;
-}
-
-static bool lb_try_acquire_backend_from_pool(lb_backend_pool_t *pool, lb_session_t *session) {
-    if (pool->ready_count == 0u) {
-        return false;
-    }
-
-    for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
-        lb_backend_pool_slot_t *slot = &pool->slots[i];
-        if (!slot->ready || slot->fd < 0) {
-            continue;
-        }
-
-        session->backend_fd = slot->fd;
-        session->zerocopy_enabled[0] = slot->zerocopy_enabled;
-        session->connected = true;
-
-        slot->fd = -1;
-        slot->ready = false;
-        slot->pending = false;
-        slot->zerocopy_enabled = false;
-        slot->connect_started_ns = 0u;
-        pool->ready_count--;
-        return true;
-    }
-
-    pool->ready_count = 0u;
-    return false;
-}
-
-static bool lb_return_backend_to_pool(lb_backend_pool_t *pool, int fd, bool zerocopy_enabled) {
-    if (fd < 0 || pool->target_size == 0u) {
-        return false;
-    }
-
-    size_t total = 0u;
-    for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
-        if (pool->slots[i].ready || pool->slots[i].pending) {
-            total++;
-        }
-    }
-    if (total >= pool->target_size) {
-        return false;
-    }
-
-    for (size_t i = 0; i < LB_BACKEND_POOL_SIZE_MAX; i++) {
-        lb_backend_pool_slot_t *slot = &pool->slots[i];
-        if (slot->fd >= 0 || slot->ready || slot->pending) {
-            continue;
-        }
-        slot->fd = fd;
-        slot->ready = true;
-        slot->pending = false;
-        slot->zerocopy_enabled = zerocopy_enabled;
-        slot->connect_started_ns = 0u;
-        pool->ready_count++;
-        return true;
-    }
-
-    return false;
-}
-
-static void lb_close_client_only(lb_session_t *session) {
-    if (session->client_fd >= 0) {
-        close(session->client_fd);
-        session->client_fd = -1;
-    }
     session->close_pending = true;
 }
 
@@ -881,17 +452,7 @@ static int lb_queue_read(struct io_uring *ring, lb_session_t *session, int sessi
     if (sqe == NULL) {
         return -1;
     }
-    if (session->buffer_len[direction] >= LB_BUFFER_SIZE) {
-        errno = ENOBUFS;
-        return -1;
-    }
-    io_uring_prep_recv(
-        sqe,
-        fd,
-        session->buffer[direction] + session->buffer_len[direction],
-        LB_BUFFER_SIZE - session->buffer_len[direction],
-        0
-    );
+    io_uring_prep_recv(sqe, fd, session->buffer[direction], LB_BUFFER_SIZE, 0);
     io_uring_sqe_set_data64(sqe, lb_pack_user_data(LB_OP_READ, session_index, direction, session->generation));
     session->read_started_ns[direction] = lb_profile.enabled ? lb_now_ns() : 0u;
     session->inflight_ops++;
@@ -920,158 +481,6 @@ static int lb_queue_write(struct io_uring *ring, lb_session_t *session, int sess
     session->write_started_ns[direction] = lb_profile.enabled ? lb_now_ns() : 0u;
     session->inflight_ops++;
     return 0;
-}
-
-static int lb_queue_request_write(struct io_uring *ring, lb_session_t *session, int session_index) {
-    session->phase = LB_PHASE_WRITING_REQUEST;
-    return lb_queue_write(ring, session, session_index, 0);
-}
-
-static int lb_queue_response_write(struct io_uring *ring, lb_session_t *session, int session_index) {
-    session->phase = LB_PHASE_WRITING_RESPONSE;
-    return lb_queue_write(ring, session, session_index, 1);
-}
-
-static int lb_prepare_client_request(lb_session_t *session) {
-    lb_http_message_t message;
-    int parse_rc = lb_parse_http_message(session->buffer[0], session->buffer_len[0], &message);
-    if (parse_rc <= 0) {
-        return parse_rc;
-    }
-
-    session->client_keep_alive = message.keep_alive;
-    if (!lb_rewrite_connection_header(session->buffer[0], LB_BUFFER_SIZE, message.total_length, true, &session->buffer_len[0])) {
-        return -1;
-    }
-    session->buffer_sent[0] = 0u;
-    return 1;
-}
-
-static int lb_prepare_backend_response(lb_session_t *session) {
-    lb_http_message_t message;
-    int parse_rc = lb_parse_http_message(session->buffer[1], session->buffer_len[1], &message);
-    if (parse_rc <= 0) {
-        return parse_rc;
-    }
-
-    session->backend_keep_alive = message.keep_alive;
-    if (!lb_rewrite_connection_header(
-        session->buffer[1],
-        LB_BUFFER_SIZE,
-        message.total_length,
-        session->client_keep_alive,
-        &session->buffer_len[1]
-    )) {
-        return -1;
-    }
-    session->buffer_sent[1] = 0u;
-    return 1;
-}
-
-static int lb_acquire_backend_for_request(
-    struct io_uring *ring,
-    lb_session_t *session,
-    int session_index,
-    size_t backend_index,
-    const lb_backend_t *backends,
-    lb_backend_pool_t *backend_pools
-) {
-    session->backend_index = (int) backend_index;
-    const lb_backend_t *backend = &backends[backend_index];
-
-    if (lb_try_acquire_backend_from_pool(&backend_pools[backend_index], session)) {
-        if (lb_profile.enabled) {
-            lb_profile.pool_hits++;
-        }
-        session->connected = true;
-        return lb_queue_request_write(ring, session, session_index);
-    }
-
-    if (lb_profile.enabled) {
-        lb_profile.pool_misses++;
-    }
-    int backend_fd = lb_open_backend_socket(backend);
-    if (backend_fd < 0) {
-        return -1;
-    }
-    session->backend_fd = backend_fd;
-    session->zerocopy_enabled[0] = lb_try_enable_zerocopy(session->backend_fd);
-    session->phase = LB_PHASE_CONNECTING_BACKEND;
-    return lb_queue_connect(ring, session, session_index, backend);
-}
-
-static bool lb_release_backend_after_response(lb_session_t *session, lb_backend_pool_t *backend_pools) {
-    if (session->backend_fd < 0 || session->backend_index < 0) {
-        session->backend_fd = -1;
-        session->connected = false;
-        session->backend_index = -1;
-        session->backend_keep_alive = false;
-        return false;
-    }
-
-    int backend_fd = session->backend_fd;
-    bool zerocopy_enabled = session->zerocopy_enabled[0];
-    bool backend_keep_alive = session->backend_keep_alive;
-    session->backend_fd = -1;
-    session->connected = false;
-    session->zerocopy_enabled[0] = false;
-    session->backend_keep_alive = false;
-
-    if (backend_keep_alive
-        && lb_return_backend_to_pool(&backend_pools[session->backend_index], backend_fd, zerocopy_enabled)) {
-        session->backend_index = -1;
-        return false;
-    }
-
-    close(backend_fd);
-    session->backend_index = -1;
-    return true;
-}
-
-static int lb_finish_request_write(struct io_uring *ring, lb_session_t *session, int session_index) {
-    if (session->pending_send_notifs[0] > 0u) {
-        session->send_complete_waiting_notif[0] = true;
-        return 0;
-    }
-    session->send_complete_waiting_notif[0] = false;
-    session->buffer_len[0] = 0u;
-    session->buffer_sent[0] = 0u;
-    session->phase = LB_PHASE_READING_RESPONSE;
-    if (lb_queue_read(ring, session, session_index, 1) < 0) {
-        return -1;
-    }
-    return 1;
-}
-
-static int lb_finish_response_write(
-    struct io_uring *ring,
-    lb_session_t *session,
-    int session_index,
-    lb_backend_pool_t *backend_pools,
-    bool *refill_pools
-) {
-    if (session->pending_send_notifs[1] > 0u) {
-        session->send_complete_waiting_notif[1] = true;
-        return 0;
-    }
-    session->send_complete_waiting_notif[1] = false;
-    session->buffer_len[1] = 0u;
-    session->buffer_sent[1] = 0u;
-    if (lb_release_backend_after_response(session, backend_pools)) {
-        *refill_pools = true;
-    }
-
-    if (!session->client_keep_alive) {
-        lb_close_client_only(session);
-        lb_maybe_finalize_session(session);
-        return 0;
-    }
-
-    session->phase = LB_PHASE_READING_REQUEST;
-    if (lb_queue_read(ring, session, session_index, 0) < 0) {
-        return -1;
-    }
-    return 1;
 }
 
 static int lb_flush_submissions(struct io_uring *ring) {
@@ -1217,6 +626,24 @@ static size_t lb_parse_backends(const char *env, lb_backend_t *out) {
     return count;
 }
 
+static int lb_finish_write(struct io_uring *ring, lb_session_t *session, int session_index, int direction) {
+    if (session->pending_send_notifs[direction] > 0u) {
+        session->send_complete_waiting_notif[direction] = true;
+        return 0;
+    }
+
+    session->send_complete_waiting_notif[direction] = false;
+    if (session->close_pending) {
+        session->buffer_len[direction] = 0;
+        session->buffer_sent[direction] = 0;
+        lb_maybe_finalize_session(session);
+        return 0;
+    }
+    session->buffer_len[direction] = 0;
+    session->buffer_sent[direction] = 0;
+    return lb_queue_read(ring, session, session_index, direction);
+}
+
 static bool lb_send_zc_should_fallback(bool used_zerocopy, int res) {
 #if LB_HAVE_SEND_ZC
     return used_zerocopy
@@ -1239,11 +666,6 @@ int main(void) {
         fprintf(stderr, "configure ao menos dois backends em BACKENDS\n");
         return 1;
     }
-    size_t backend_pool_size = lb_env_size(
-        "RINHA_LB_BACKEND_POOL_SIZE",
-        LB_BACKEND_POOL_SIZE_DEFAULT,
-        LB_BACKEND_POOL_SIZE_MAX
-    );
 
     int listen_fd = lb_open_listener(LB_PORT);
     if (listen_fd < 0) {
@@ -1269,42 +691,18 @@ int main(void) {
         sessions[i].backend_fd = -1;
     }
 
-    lb_backend_pool_t backend_pools[LB_MAX_BACKENDS];
-    for (size_t i = 0; i < backend_count; i++) {
-        lb_backend_pool_init(&backend_pools[i], backend_pool_size);
-    }
-
     lb_accept_state_t accept_state;
     memset(&accept_state, 0, sizeof(accept_state));
     int accept_rc = lb_queue_accept(&ring, listen_fd, &accept_state);
     if (accept_rc < 0) {
         fprintf(stderr, "falha ao submeter accept inicial no io_uring do balanceador: rc=%d\n", accept_rc);
-        for (size_t i = 0; i < backend_count; i++) {
-            lb_backend_pool_close(&backend_pools[i]);
-        }
         free(sessions);
         io_uring_queue_exit(&ring);
         close(listen_fd);
         return 1;
     }
-    for (int backend_index = 0; backend_index < (int) backend_count; backend_index++) {
-        int fill_rc = lb_fill_backend_pool(&ring, &backend_pools[backend_index], backend_index, &backends[backend_index]);
-        if (fill_rc < 0) {
-            fprintf(stderr, "falha ao preencher pool inicial do backend %d\n", backend_index);
-            for (size_t i = 0; i < backend_count; i++) {
-                lb_backend_pool_close(&backend_pools[i]);
-            }
-            free(sessions);
-            io_uring_queue_exit(&ring);
-            close(listen_fd);
-            return 1;
-        }
-    }
     if (lb_flush_submissions(&ring) < 0) {
         fprintf(stderr, "falha ao submeter accept inicial no io_uring do balanceador\n");
-        for (size_t i = 0; i < backend_count; i++) {
-            lb_backend_pool_close(&backend_pools[i]);
-        }
         free(sessions);
         io_uring_queue_exit(&ring);
         close(listen_fd);
@@ -1324,7 +722,6 @@ int main(void) {
 
         bool need_submit = false;
         bool fatal_error = false;
-        bool refill_pools = false;
         for (ssize_t i = 0; i < cqe_count; i++) {
             uint64_t user_data = cqes[i].user_data;
             lb_op_type_t type;
@@ -1355,13 +752,27 @@ int main(void) {
                         lb_set_nonblocking(session->client_fd);
                         session->zerocopy_enabled[1] = lb_try_enable_zerocopy(session->client_fd);
                         session->session_started_ns = lb_profile.enabled ? completed_ns : 0u;
-                        session->phase = LB_PHASE_READING_REQUEST;
-                        if (lb_queue_read(&ring, session, accepted_session_index, 0) < 0) {
+
+                        const lb_backend_t *backend = &backends[next_backend % backend_count];
+                        next_backend++;
+
+                        int backend_fd = socket(((struct sockaddr *) &backend->addr)->sa_family, SOCK_STREAM, 0);
+                        if (backend_fd >= 0 && lb_set_nonblocking(backend_fd) == 0) {
+                            session->backend_fd = backend_fd;
+                            session->zerocopy_enabled[0] = lb_try_enable_zerocopy(session->backend_fd);
+                            if (lb_queue_connect(&ring, session, accepted_session_index, backend) < 0) {
+                                lb_request_close(session);
+                                lb_maybe_finalize_session(session);
+                                fatal_error = true;
+                            } else {
+                                need_submit = true;
+                            }
+                        } else {
+                            if (backend_fd >= 0) {
+                                close(backend_fd);
+                            }
                             lb_request_close(session);
                             lb_maybe_finalize_session(session);
-                            fatal_error = true;
-                        } else {
-                            need_submit = true;
                         }
                     } else {
                         close(res);
@@ -1372,40 +783,6 @@ int main(void) {
                 } else {
                     need_submit = true;
                 }
-                continue;
-            }
-
-            if (type == LB_OP_POOL_CONNECT) {
-                if (session_index < 0 || session_index >= (int) backend_count
-                    || direction < 0 || direction >= LB_BACKEND_POOL_SIZE_MAX) {
-                    continue;
-                }
-                lb_backend_pool_t *pool = &backend_pools[session_index];
-                lb_backend_pool_slot_t *slot = &pool->slots[direction];
-                if (!slot->pending || slot->fd < 0) {
-                    continue;
-                }
-                slot->pending = false;
-                if (lb_profile.enabled) {
-                    lb_profile.pool_connect_ops++;
-                    if (slot->connect_started_ns != 0u) {
-                        lb_profile.pool_connect_ns += completed_ns - slot->connect_started_ns;
-                    }
-                    if (res < 0) {
-                        lb_profile.pool_connect_failures++;
-                    }
-                }
-                slot->connect_started_ns = 0u;
-                if (res < 0) {
-                    close(slot->fd);
-                    slot->fd = -1;
-                    slot->ready = false;
-                    slot->zerocopy_enabled = false;
-                } else {
-                    slot->ready = true;
-                    pool->ready_count++;
-                }
-                refill_pools = true;
                 continue;
             }
 
@@ -1440,7 +817,8 @@ int main(void) {
                     continue;
                 }
                 session->connected = true;
-                if (lb_queue_request_write(&ring, session, session_index) < 0) {
+                if (lb_queue_read(&ring, session, session_index, 0) < 0
+                    || lb_queue_read(&ring, session, session_index, 1) < 0) {
                     lb_request_close(session);
                     lb_maybe_finalize_session(session);
                     fatal_error = true;
@@ -1470,75 +848,15 @@ int main(void) {
                     continue;
                 }
 
-                session->buffer_len[direction] += (size_t) res;
-
-                if (session->phase == LB_PHASE_READING_REQUEST && direction == 0) {
-                    int prepare_rc = lb_prepare_client_request(session);
-                    if (prepare_rc < 0) {
-                        lb_request_close(session);
-                        lb_maybe_finalize_session(session);
-                        continue;
-                    }
-                    if (prepare_rc == 0) {
-                        if (lb_queue_read(&ring, session, session_index, 0) < 0) {
-                            lb_request_close(session);
-                            lb_maybe_finalize_session(session);
-                            fatal_error = true;
-                        } else {
-                            need_submit = true;
-                        }
-                        continue;
-                    }
-
-                    size_t backend_index = next_backend % backend_count;
-                    next_backend++;
-                    if (lb_acquire_backend_for_request(
-                            &ring,
-                            session,
-                            session_index,
-                            backend_index,
-                            backends,
-                            backend_pools
-                        ) < 0) {
-                        lb_request_close(session);
-                        lb_maybe_finalize_session(session);
-                        fatal_error = true;
-                    } else {
-                        need_submit = true;
-                    }
-                    continue;
+                session->buffer_len[direction] = (size_t) res;
+                session->buffer_sent[direction] = 0;
+                if (lb_queue_write(&ring, session, session_index, direction) < 0) {
+                    lb_request_close(session);
+                    lb_maybe_finalize_session(session);
+                    fatal_error = true;
+                } else {
+                    need_submit = true;
                 }
-
-                if (session->phase == LB_PHASE_READING_RESPONSE && direction == 1) {
-                    int prepare_rc = lb_prepare_backend_response(session);
-                    if (prepare_rc < 0) {
-                        lb_request_close(session);
-                        lb_maybe_finalize_session(session);
-                        continue;
-                    }
-                    if (prepare_rc == 0) {
-                        if (lb_queue_read(&ring, session, session_index, 1) < 0) {
-                            lb_request_close(session);
-                            lb_maybe_finalize_session(session);
-                            fatal_error = true;
-                        } else {
-                            need_submit = true;
-                        }
-                        continue;
-                    }
-
-                    if (lb_queue_response_write(&ring, session, session_index) < 0) {
-                        lb_request_close(session);
-                        lb_maybe_finalize_session(session);
-                        fatal_error = true;
-                    } else {
-                        need_submit = true;
-                    }
-                    continue;
-                }
-
-                lb_request_close(session);
-                lb_maybe_finalize_session(session);
                 continue;
             }
 
@@ -1555,18 +873,7 @@ int main(void) {
                     }
                     if (session->send_complete_waiting_notif[direction]
                         && session->pending_send_notifs[direction] == 0u) {
-                        int finish_rc;
-                        if (direction == 0) {
-                            finish_rc = lb_finish_request_write(&ring, session, session_index);
-                        } else {
-                            finish_rc = lb_finish_response_write(
-                                &ring,
-                                session,
-                                session_index,
-                                backend_pools,
-                                &refill_pools
-                            );
-                        }
+                        int finish_rc = lb_finish_write(&ring, session, session_index, direction);
                         if (finish_rc < 0) {
                             lb_request_close(session);
                             lb_maybe_finalize_session(session);
@@ -1637,36 +944,12 @@ int main(void) {
                         lb_profile_report("periodic");
                     }
                 }
-                int finish_rc;
-                if (direction == 0) {
-                    finish_rc = lb_finish_request_write(&ring, session, session_index);
-                } else {
-                    finish_rc = lb_finish_response_write(
-                        &ring,
-                        session,
-                        session_index,
-                        backend_pools,
-                        &refill_pools
-                    );
-                }
+                int finish_rc = lb_finish_write(&ring, session, session_index, direction);
                 if (finish_rc < 0) {
                     lb_request_close(session);
                     lb_maybe_finalize_session(session);
                     fatal_error = true;
                 } else if (finish_rc > 0) {
-                    need_submit = true;
-                }
-            }
-        }
-
-        if (!fatal_error && refill_pools) {
-            for (int backend_index = 0; backend_index < (int) backend_count; backend_index++) {
-                int fill_rc = lb_fill_backend_pool(&ring, &backend_pools[backend_index], backend_index, &backends[backend_index]);
-                if (fill_rc < 0) {
-                    fatal_error = true;
-                    break;
-                }
-                if (fill_rc == 0) {
                     need_submit = true;
                 }
             }
@@ -1684,9 +967,6 @@ int main(void) {
         if (sessions[i].used) {
             lb_finalize_session(&sessions[i]);
         }
-    }
-    for (size_t i = 0; i < backend_count; i++) {
-        lb_backend_pool_close(&backend_pools[i]);
     }
     free(sessions);
     io_uring_queue_exit(&ring);

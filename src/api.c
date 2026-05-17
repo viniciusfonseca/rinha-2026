@@ -4,7 +4,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <liburing.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -17,7 +16,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
 #define API_BACKLOG 1024
@@ -72,10 +70,6 @@ typedef struct {
     size_t read_len;
     size_t write_len;
     size_t write_sent;
-    uint64_t request_started_ns;
-    uint32_t request_recv_ops;
-    uint32_t request_recv_bytes;
-    const char *write_ptr;
     char read_buf[API_READ_BUFFER + 1];
     char write_buf[API_WRITE_BUFFER];
 } api_conn_t;
@@ -86,222 +80,7 @@ typedef struct {
     unsigned flags;
 } api_cqe_record_t;
 
-typedef struct {
-    bool initialized;
-    bool enabled;
-    uint64_t report_every;
-    uint64_t requests_completed;
-    uint64_t business_calls;
-    uint64_t fraud_score_requests;
-    uint64_t ready_requests;
-    uint64_t keep_alive_requests;
-    uint64_t close_requests;
-    uint64_t recv_ops;
-    uint64_t recv_bytes;
-    uint64_t recv_wall_ns;
-    uint64_t parse_ops;
-    uint64_t parse_ns;
-    uint64_t business_ns;
-    uint64_t business_payload_parse_ns;
-    uint64_t business_vectorize_ns;
-    uint64_t business_index_ns;
-    uint64_t business_finalize_ns;
-} api_profile_t;
-
 static volatile sig_atomic_t api_running = 1;
-static api_profile_t api_profile = {0};
-
-static bool api_env_truthy(const char *value) {
-    if (value == NULL || value[0] == '\0') {
-        return false;
-    }
-    if (strcmp(value, "0") == 0 ||
-        strcmp(value, "false") == 0 ||
-        strcmp(value, "False") == 0 ||
-        strcmp(value, "FALSE") == 0 ||
-        strcmp(value, "no") == 0 ||
-        strcmp(value, "No") == 0 ||
-        strcmp(value, "NO") == 0 ||
-        strcmp(value, "off") == 0 ||
-        strcmp(value, "Off") == 0 ||
-        strcmp(value, "OFF") == 0) {
-        return false;
-    }
-    return true;
-}
-
-static uint64_t api_env_u64(const char *name, uint64_t fallback) {
-    const char *value = getenv(name);
-    if (value == NULL || value[0] == '\0') {
-        return fallback;
-    }
-
-    char *end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (end == value || *end != '\0' || parsed == 0ull) {
-        return fallback;
-    }
-    return (uint64_t) parsed;
-}
-
-static uint64_t api_now_ns(void) {
-    struct timespec ts;
-#ifdef CLOCK_MONOTONIC_RAW
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-#else
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-#endif
-    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
-}
-
-static double api_avg_us(uint64_t total_ns, uint64_t count) {
-    if (count == 0u) {
-        return 0.0;
-    }
-    return (double) total_ns / (double) count / 1000.0;
-}
-
-static double api_avg_count(uint64_t total, uint64_t count) {
-    if (count == 0u) {
-        return 0.0;
-    }
-    return (double) total / (double) count;
-}
-
-static void api_profile_report(const char *reason) {
-    if (!api_profile.enabled) {
-        return;
-    }
-
-    double avg_recv_us = api_avg_us(api_profile.recv_wall_ns, api_profile.requests_completed);
-    double avg_business_us = api_avg_us(api_profile.business_ns, api_profile.business_calls);
-    double business_vs_recv = avg_recv_us > 0.0 ? avg_business_us / avg_recv_us : 0.0;
-    double avg_payload_parse_us = api_avg_us(api_profile.business_payload_parse_ns, api_profile.business_calls);
-    double avg_vectorize_us = api_avg_us(api_profile.business_vectorize_ns, api_profile.business_calls);
-    double avg_index_us = api_avg_us(api_profile.business_index_ns, api_profile.business_calls);
-    double avg_finalize_us = api_avg_us(api_profile.business_finalize_ns, api_profile.business_calls);
-
-    fprintf(
-        stderr,
-        "[api-prof] reason=%s requests=%" PRIu64
-        " fraud_requests=%" PRIu64 " ready_requests=%" PRIu64
-        " keep_alive=%" PRIu64 " close=%" PRIu64
-        " avg_request_recv_us=%.2f avg_parse_us=%.2f avg_handle_business_us=%.2f"
-        " avg_payload_parse_us=%.2f avg_vectorize_us=%.2f avg_index_us=%.2f avg_finalize_us=%.2f"
-        " handle_vs_recv=%.2fx avg_recv_ops=%.2f avg_request_bytes=%.2f\n",
-        reason,
-        api_profile.requests_completed,
-        api_profile.fraud_score_requests,
-        api_profile.ready_requests,
-        api_profile.keep_alive_requests,
-        api_profile.close_requests,
-        avg_recv_us,
-        api_avg_us(api_profile.parse_ns, api_profile.parse_ops),
-        avg_business_us,
-        avg_payload_parse_us,
-        avg_vectorize_us,
-        avg_index_us,
-        avg_finalize_us,
-        business_vs_recv,
-        api_avg_count(api_profile.recv_ops, api_profile.requests_completed),
-        api_avg_count(api_profile.recv_bytes, api_profile.requests_completed)
-    );
-}
-
-static void api_profile_flush(void) {
-    api_profile_report("exit");
-}
-
-static void api_profile_init(void) {
-    if (api_profile.initialized) {
-        return;
-    }
-
-    api_profile.initialized = true;
-    api_profile.enabled = api_env_truthy(getenv("RINHA_API_PROFILE"));
-    api_profile.report_every = api_env_u64("RINHA_API_PROFILE_EVERY", 1000u);
-    if (api_profile.enabled) {
-        atexit(api_profile_flush);
-    }
-}
-
-static void api_profile_on_recv_complete(api_conn_t *conn, size_t bytes) {
-    if (!api_profile.enabled) {
-        return;
-    }
-    if (conn->request_started_ns == 0u) {
-        conn->request_started_ns = api_now_ns();
-        conn->request_recv_ops = 0u;
-        conn->request_recv_bytes = 0u;
-    }
-    conn->request_recv_ops++;
-    conn->request_recv_bytes += (uint32_t) bytes;
-}
-
-static void api_profile_note_parse(uint64_t elapsed_ns) {
-    if (!api_profile.enabled) {
-        return;
-    }
-    api_profile.parse_ops++;
-    api_profile.parse_ns += elapsed_ns;
-}
-
-static void api_profile_complete_request(api_conn_t *conn, const api_request_t *request) {
-    if (!api_profile.enabled) {
-        return;
-    }
-
-    api_profile.requests_completed++;
-    api_profile.recv_ops += conn->request_recv_ops;
-    api_profile.recv_bytes += conn->request_recv_bytes;
-    if (conn->request_started_ns != 0u) {
-        api_profile.recv_wall_ns += api_now_ns() - conn->request_started_ns;
-    }
-    if (request != NULL) {
-        if (request->route == API_ROUTE_FRAUD_SCORE) {
-            api_profile.fraud_score_requests++;
-        } else if (request->route == API_ROUTE_READY) {
-            api_profile.ready_requests++;
-        }
-        if (request->keep_alive) {
-            api_profile.keep_alive_requests++;
-        } else {
-            api_profile.close_requests++;
-        }
-    }
-
-    conn->request_started_ns = 0u;
-    conn->request_recv_ops = 0u;
-    conn->request_recv_bytes = 0u;
-
-    if (api_profile.report_every > 0u &&
-        api_profile.requests_completed % api_profile.report_every == 0u) {
-        api_profile_report("periodic");
-    }
-}
-
-static void api_profile_note_business(uint64_t elapsed_ns) {
-    if (!api_profile.enabled) {
-        return;
-    }
-    api_profile.business_calls++;
-    api_profile.business_ns += elapsed_ns;
-}
-
-static void api_profile_note_business_breakdown(
-    uint64_t payload_parse_ns,
-    uint64_t vectorize_ns,
-    uint64_t index_ns,
-    uint64_t finalize_ns
-) {
-    if (!api_profile.enabled) {
-        return;
-    }
-    api_profile.business_payload_parse_ns += payload_parse_ns;
-    api_profile.business_vectorize_ns += vectorize_ns;
-    api_profile.business_index_ns += index_ns;
-    api_profile.business_finalize_ns += finalize_ns;
-}
 
 static void api_on_signal(int signo) {
     (void) signo;
@@ -404,10 +183,6 @@ static void api_finalize_conn(api_conn_t *conn, int conn_index, int *free_slots,
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
-    conn->request_started_ns = 0u;
-    conn->request_recv_ops = 0u;
-    conn->request_recv_bytes = 0u;
-    conn->write_ptr = conn->write_buf;
 
     if (was_used && conn_index >= 0) {
         free_slots[(*free_count)++] = conn_index;
@@ -435,10 +210,6 @@ static int api_alloc_conn(api_conn_t *connections, int *free_slots, size_t *free
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
-    conn->request_started_ns = 0u;
-    conn->request_recv_ops = 0u;
-    conn->request_recv_bytes = 0u;
-    conn->write_ptr = conn->write_buf;
     return i;
 }
 
@@ -449,9 +220,6 @@ static void api_request_close(api_conn_t *conn) {
     }
     conn->keep_alive = false;
     conn->close_pending = true;
-    conn->request_started_ns = 0u;
-    conn->request_recv_ops = 0u;
-    conn->request_recv_bytes = 0u;
 }
 
 static void api_maybe_finalize_conn(
@@ -492,7 +260,7 @@ static int api_queue_send(struct io_uring *ring, api_conn_t *conn, int conn_inde
     if (sqe == NULL) {
         return -1;
     }
-    const void *buf = conn->write_ptr + conn->write_sent;
+    const void *buf = conn->write_buf + conn->write_sent;
     size_t len = conn->write_len - conn->write_sent;
 #if API_HAVE_SEND_ZC
     if (conn->zerocopy_enabled) {
@@ -577,57 +345,17 @@ static char *api_write_size(char *dst, size_t value) {
     return dst;
 }
 
-typedef struct {
-    const char *data;
-    size_t len;
-} api_static_response_t;
-
-#define API_STATIC_RESPONSE_LITERAL(literal) { literal, sizeof(literal) - 1u }
-#define API_FRAUD_RESPONSE_CLOSE(content_length, body) \
-    API_STATIC_RESPONSE_LITERAL( \
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " content_length \
-        "\r\nConnection: close\r\n\r\n" body \
-    )
-#define API_FRAUD_RESPONSE_KEEP_ALIVE(content_length, body) \
-    API_STATIC_RESPONSE_LITERAL( \
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " content_length \
-        "\r\nConnection: keep-alive\r\n\r\n" body \
-    )
-
-static const api_static_response_t API_FRAUD_RESPONSES[2][6] = {
-    {
-        API_FRAUD_RESPONSE_CLOSE("35", "{\"approved\":true,\"fraud_score\":0.0}"),
-        API_FRAUD_RESPONSE_CLOSE("35", "{\"approved\":true,\"fraud_score\":0.2}"),
-        API_FRAUD_RESPONSE_CLOSE("35", "{\"approved\":true,\"fraud_score\":0.4}"),
-        API_FRAUD_RESPONSE_CLOSE("36", "{\"approved\":false,\"fraud_score\":0.6}"),
-        API_FRAUD_RESPONSE_CLOSE("36", "{\"approved\":false,\"fraud_score\":0.8}"),
-        API_FRAUD_RESPONSE_CLOSE("36", "{\"approved\":false,\"fraud_score\":1.0}"),
-    },
-    {
-        API_FRAUD_RESPONSE_KEEP_ALIVE("35", "{\"approved\":true,\"fraud_score\":0.0}"),
-        API_FRAUD_RESPONSE_KEEP_ALIVE("35", "{\"approved\":true,\"fraud_score\":0.2}"),
-        API_FRAUD_RESPONSE_KEEP_ALIVE("35", "{\"approved\":true,\"fraud_score\":0.4}"),
-        API_FRAUD_RESPONSE_KEEP_ALIVE("36", "{\"approved\":false,\"fraud_score\":0.6}"),
-        API_FRAUD_RESPONSE_KEEP_ALIVE("36", "{\"approved\":false,\"fraud_score\":0.8}"),
-        API_FRAUD_RESPONSE_KEEP_ALIVE("36", "{\"approved\":false,\"fraud_score\":1.0}"),
-    },
-};
-
-#undef API_FRAUD_RESPONSE_KEEP_ALIVE
-#undef API_FRAUD_RESPONSE_CLOSE
-#undef API_STATIC_RESPONSE_LITERAL
-
-static void api_prepare_response_len(
+static void api_prepare_response(
     api_conn_t *conn,
     const char *status,
     const char *content_type,
     const char *body,
-    size_t body_len,
     bool keep_alive
 ) {
     const char *connection = keep_alive ? "keep-alive" : "close";
     char *p = conn->write_buf;
     char *end = conn->write_buf + sizeof(conn->write_buf);
+    size_t body_len = body == NULL ? 0u : strlen(body);
 
     p = api_copy_str(p, "HTTP/1.1 ");
     p = api_copy_str(p, status);
@@ -647,21 +375,9 @@ static void api_prepare_response_len(
         p += body_len;
     }
 
-    conn->write_ptr = conn->write_buf;
     conn->write_len = (size_t) (p - conn->write_buf);
     conn->write_sent = 0;
     conn->keep_alive = keep_alive;
-}
-
-static void api_prepare_response(
-    api_conn_t *conn,
-    const char *status,
-    const char *content_type,
-    const char *body,
-    bool keep_alive
-) {
-    size_t body_len = body == NULL ? 0u : strlen(body);
-    api_prepare_response_len(conn, status, content_type, body, body_len, keep_alive);
 }
 
 static void api_prepare_no_content(api_conn_t *conn, bool keep_alive) {
@@ -669,19 +385,7 @@ static void api_prepare_no_content(api_conn_t *conn, bool keep_alive) {
     p = api_copy_str(p, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: ");
     p = api_copy_str(p, keep_alive ? "keep-alive" : "close");
     p = api_copy_str(p, "\r\n\r\n");
-    conn->write_ptr = conn->write_buf;
     conn->write_len = (size_t) (p - conn->write_buf);
-    conn->write_sent = 0;
-    conn->keep_alive = keep_alive;
-}
-
-static void api_prepare_static_response(
-    api_conn_t *conn,
-    const api_static_response_t *response,
-    bool keep_alive
-) {
-    conn->write_ptr = response->data;
-    conn->write_len = response->len;
     conn->write_sent = 0;
     conn->keep_alive = keep_alive;
 }
@@ -698,32 +402,31 @@ static void api_handle_business(api_conn_t *conn, const api_request_t *request, 
     }
 
     rinha_tx_payload_t payload;
-    uint64_t step_started_ns = api_profile.enabled ? api_now_ns() : 0u;
     if (!rinha_parse_tx_payload(request->body, request->content_length, &payload)) {
-        uint64_t payload_parse_ns = api_profile.enabled && step_started_ns != 0u ? api_now_ns() - step_started_ns : 0u;
-        api_profile_note_business_breakdown(payload_parse_ns, 0u, 0u, 0u);
         api_prepare_response(conn, "400 Bad Request", "text/plain", "invalid payload", false);
         return;
     }
-    uint64_t payload_parse_ns = api_profile.enabled && step_started_ns != 0u ? api_now_ns() - step_started_ns : 0u;
 
     float vector[RINHA_DIM];
-    step_started_ns = api_profile.enabled ? api_now_ns() : 0u;
     rinha_payload_to_vector(&payload, vector);
-    uint64_t vectorize_ns = api_profile.enabled && step_started_ns != 0u ? api_now_ns() - step_started_ns : 0u;
 
-    step_started_ns = api_profile.enabled ? api_now_ns() : 0u;
     int fraud_count = rinha_index_fraud_count_top5(index, vector);
-    uint64_t index_ns = api_profile.enabled && step_started_ns != 0u ? api_now_ns() - step_started_ns : 0u;
-
-    step_started_ns = api_profile.enabled ? api_now_ns() : 0u;
     if (fraud_count == 2 && rinha_payload_force_deny_borderline(&payload)) {
         fraud_count = 3;
     }
-    const api_static_response_t *response = &API_FRAUD_RESPONSES[request->keep_alive ? 1u : 0u][fraud_count];
-    api_prepare_static_response(conn, response, request->keep_alive);
-    uint64_t finalize_ns = api_profile.enabled && step_started_ns != 0u ? api_now_ns() - step_started_ns : 0u;
-    api_profile_note_business_breakdown(payload_parse_ns, vectorize_ns, index_ns, finalize_ns);
+    float fraud_score = (float) fraud_count / 5.0f;
+    bool approved = fraud_score < 0.6f;
+
+    char body[96];
+    static const char *const score_texts[] = {"0.0", "0.2", "0.4", "0.6", "0.8", "1.0"};
+    char *p = body;
+    p = api_copy_str(p, "{\"approved\":");
+    p = api_copy_str(p, approved ? "true" : "false");
+    p = api_copy_str(p, ",\"fraud_score\":");
+    p = api_copy_str(p, score_texts[fraud_count]);
+    p = api_copy_str(p, "}");
+    *p = '\0';
+    api_prepare_response(conn, "200 OK", "application/json", body, request->keep_alive);
 }
 
 static int api_finish_response(
@@ -748,11 +451,7 @@ static int api_finish_response(
     conn->read_len = 0;
     conn->write_len = 0;
     conn->write_sent = 0;
-    conn->write_ptr = conn->write_buf;
-    if (api_queue_recv(ring, conn, conn_index) < 0) {
-        return -1;
-    }
-    return 1;
+    return api_queue_recv(ring, conn, conn_index);
 }
 
 static bool api_send_zc_should_fallback(bool used_zerocopy, int res) {
@@ -778,7 +477,6 @@ int main(void) {
 
     signal(SIGINT, api_on_signal);
     signal(SIGTERM, api_on_signal);
-    api_profile_init();
 
     rinha_index_t index;
     if (!rinha_index_open(&index, index_path)) {
@@ -907,19 +605,13 @@ int main(void) {
                     continue;
                 }
 
-                api_profile_on_recv_complete(conn, (size_t) res);
                 conn->read_len += (size_t) res;
                 conn->read_buf[conn->read_len] = '\0';
 
                 api_request_t request;
-                uint64_t parse_started_ns = api_profile.enabled ? api_now_ns() : 0u;
                 int parse_rc = api_parse_http_request(conn->read_buf, conn->read_len, &request);
-                if (api_profile.enabled && parse_started_ns != 0u) {
-                    api_profile_note_parse(api_now_ns() - parse_started_ns);
-                }
                 if (parse_rc == 0) {
                     if (conn->read_len >= API_READ_BUFFER) {
-                        api_profile_complete_request(conn, NULL);
                         api_prepare_response(conn, "413 Payload Too Large", "text/plain", "payload too large", false);
                         if (api_queue_send(&ring, conn, conn_index) < 0) {
                             fatal_error = true;
@@ -935,15 +627,9 @@ int main(void) {
                 }
 
                 if (parse_rc < 0) {
-                    api_profile_complete_request(conn, NULL);
                     api_prepare_response(conn, "400 Bad Request", "text/plain", "bad request", false);
                 } else {
-                    api_profile_complete_request(conn, &request);
-                    uint64_t business_started_ns = api_profile.enabled ? api_now_ns() : 0u;
                     api_handle_business(conn, &request, &index);
-                    if (api_profile.enabled && business_started_ns != 0u) {
-                        api_profile_note_business(api_now_ns() - business_started_ns);
-                    }
                 }
 
                 if (api_queue_send(&ring, conn, conn_index) < 0) {

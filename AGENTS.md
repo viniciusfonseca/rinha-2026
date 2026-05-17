@@ -20,7 +20,6 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
   - usa `generation` em `user_data` para evitar reaproveitamento incorreto de CQEs
   - drena CQEs em lote e faz flush de SQEs ao final de cada lote
   - orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON
-  - aceita profiler opcional via `RINHA_API_PROFILE` para comparar recebimento/parsing da request com `handle business`
 
 - `src/api_http.c`
   - faz o parse HTTP de rota, `Content-Length`, corpo e `keep-alive`
@@ -28,15 +27,13 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 - `src/lb.c`
   - proxy TCP entre cliente e LB, e unix sockets entre LB e APIs
   - mantem conexoes ativas e distribui em round-robin
-  - suporta um pool quente de conexoes preabertas para backend, controlado por `RINHA_LB_BACKEND_POOL_SIZE`
-  - o pool agora faz reuso real entre sessoes: request completa para a API com `keep-alive`, response completa de volta ao cliente e devolucao do socket unix ao pool quando possivel
   - drena CQEs em lote e faz flush de SQEs ao final de cada lote
 
 - `src/vectorize.c`
   - faz o parse JSON especializado do payload da Rinha
 
 - `src/vector_features.c`
-  - converte o payload parseado em um vetor logico de 14 dimensoes e o grava no layout fisico interno de 16 dimensoes
+  - converte o payload parseado em um vetor de 14 dimensoes
 
 - `src/vectorize_payload.h`
   - define o contrato interno entre parser de payload e vetorizacao
@@ -52,7 +49,6 @@ Este repositorio implementa a solucao da Rinha de Backend 2026 em C, com:
 
 - `src/common.h`
   - concentra dimensao do vetor, parametros globais do indice e `rinha_clamp01`
-  - estado atual: `RINHA_FEATURE_DIM = 14`, `RINHA_DIM = 16`
 
 - `src/quantize.c`
   - concentra quantizacao/dequantizacao em 16 bits
@@ -73,7 +69,6 @@ O estado atual e:
 - cada lista e ordenada por raio no preprocess e quebrada em blocos com metadados `min/max radius` para poda intra-lista
 - arquivo serializado sem payload morto de `PQ`
 - vetores armazenados em `uint16_t` para reduzir memoria e manter boa fidelidade
-- padding interno de `14 -> 16` dimensoes para alinhar o caminho AVX2 em `8 + 8`
 - em x86, o caminho de distancia usa SIMD AVX2 com dequantizacao direta em registrador; em outras arquiteturas existe fallback scalar
 
 Se encontrar documentacao antiga mencionando LSH como estrategia principal, trate como desatualizada e confirme no codigo atual.
@@ -127,16 +122,11 @@ Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linu
 
 ## Telemetria Opcional
 
-- Para perfilar recebimento/parsing da API versus `handle business`, use:
-  - `RINHA_API_PROFILE=1`
-  - `RINHA_API_PROFILE_EVERY=1000`
-- Os logs mostram tempo medio de recebimento completo da request, parse HTTP, `handle business` e a quebra interna de `handle business` em `payload_parse`, `vectorize`, `index` e `finalize`.
-
 - Para perfilar a busca do indice sem mudar codigo, use:
   - `RINHA_INDEX_PROFILE=1`
   - `RINHA_INDEX_PROFILE_EVERY=1000`
 - As APIs passam essas variaveis pelo `docker-compose.yml`.
-- Os logs mostram tempo medio por fase, quebra de scan em `prepare` e `kernel`, e volume medio de listas, blocos e vetores escaneados por request.
+- Os logs mostram tempo medio por fase e volume medio de listas e vetores escaneados por request.
 
 ## Armadilhas Conhecidas
 
@@ -144,7 +134,6 @@ Nao transforme o caminho de Mac no padrao. O ambiente-alvo da competicao e `linu
 - a comunicacao interna LB -> API usa unix sockets em `/run/rinha`
 - o LB ja estourou memoria quando buffers e sessoes estavam grandes demais
 - o LB ja teve bug de reuse de sessao com CQEs antigos; preserve a logica de `generation`
-- o reuso de backend depende do keep-alive interno da API; se `api_finish_response` parar de reenfileirar/submitar o proximo `recv`, a reutilizacao trava na segunda rodada
 - o build da imagem depende de rede para baixar `references.json.gz`
 - `README.md` pode ficar atrasado em relacao ao estado real do indice
 

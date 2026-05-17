@@ -10,8 +10,6 @@ x-api: &api
     API_SOCKET_PATH: /run/rinha/api.sock
     RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
     RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
-    RINHA_API_PROFILE: ${RINHA_API_PROFILE:-}
-    RINHA_API_PROFILE_EVERY: ${RINHA_API_PROFILE_EVERY:-}
   security_opt:
     - seccomp=unconfined
   
@@ -39,7 +37,6 @@ services:
       BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock
       RINHA_LB_PROFILE: ${RINHA_LB_PROFILE:-}
       RINHA_LB_PROFILE_EVERY: ${RINHA_LB_PROFILE_EVERY:-}
-      RINHA_LB_BACKEND_POOL_SIZE: ${RINHA_LB_BACKEND_POOL_SIZE:-}
       # BACKENDS: unix:/run/rinha/api1.sock,unix:/run/rinha/api2.sock,unix:/run/rinha/api3.sock
     ports:
       - "9999:9999"
@@ -67,8 +64,6 @@ services:
       API_SOCKET_PATH: /run/rinha/api1.sock
       RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
       RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
-      RINHA_API_PROFILE: ${RINHA_API_PROFILE:-}
-      RINHA_API_PROFILE_EVERY: ${RINHA_API_PROFILE_EVERY:-}
     cpuset: "0,1"
 
   api2:
@@ -78,8 +73,6 @@ services:
       API_SOCKET_PATH: /run/rinha/api2.sock
       RINHA_INDEX_PROFILE: ${RINHA_INDEX_PROFILE:-}
       RINHA_INDEX_PROFILE_EVERY: ${RINHA_INDEX_PROFILE_EVERY:-}
-      RINHA_API_PROFILE: ${RINHA_API_PROFILE:-}
-      RINHA_API_PROFILE_EVERY: ${RINHA_API_PROFILE_EVERY:-}
     cpuset: "2,3"
   # api3:
   #   <<: *api

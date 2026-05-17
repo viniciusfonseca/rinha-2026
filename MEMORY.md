@@ -20,8 +20,6 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
   - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
   - Orquestra parse HTTP, vetorizacao, consulta ao indice e resposta JSON.
   - Quando o indice retorna `2/5`, aplica um override estreito de fraude para um padrao remoto de alto risco antes de responder.
-  - O caminho de keep-alive depende de `api_finish_response` reenfileirar o proximo `recv` e retornar `> 0` para forcar novo `submit`; sem isso, o reuso de sockets internos trava na segunda reutilizacao.
-  - Agora tambem aceita profiler opcional para comparar recebimento/parsing da request com `handle business`.
 
 - [src/api_http.c](./src/api_http.c)
   - Parser HTTP pequeno para `GET /ready` e `POST /fraud-score`.
@@ -29,11 +27,9 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 
 - [src/lb.c](./src/lb.c)
   - Proxy TCP round-robin para clientes e proxy via unix sockets para as APIs.
-  - Transparente para payload, mas agora interpreta fronteiras HTTP para reescrever `Connection` entre cliente e backend.
+  - Transparente para HTTP; nao interpreta payload.
   - Usa identificador com `generation` em `user_data` para descartar CQEs antigos e evitar corrupcao em reuse de sessoes.
   - Agora drena CQEs em lote e so faz flush de SQEs ao final de cada lote.
-  - Agora tambem suporta um pool quente de conexoes preabertas para os backends, configurado por `RINHA_LB_BACKEND_POOL_SIZE`.
-  - O pool agora recicla conexoes entre sessoes diferentes: o LB le a request inteira, reescreve `Connection: keep-alive` para a API, le a response inteira, reescreve o `Connection` de volta para o cliente e devolve o socket unix ao pool quando a API mantem a conexao aberta.
   - Foi ajustado para caber no limite de memoria do LB.
 
 - [src/vectorize.c](./src/vectorize.c)
@@ -52,7 +48,7 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/index.c](./src/index.c)
   - Consulta o `index.bin`.
   - Estrategia atual: aquecer a busca com as `nprobe` listas de centroides mais proximos, podar listas restantes por raio sem `sqrt`, ordenar so as sobreviventes por `lower bound`, podar blocos intra-lista por faixa de raio e parar cedo quando o `top-5` ja esta matematicamente fechado.
-  - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, em duas metades `8 + 8`, e corta o calculo assim que a soma parcial ja passa do pior do `top-5`.
+  - O loop quente de distancia em x86 faz dequantizacao AVX2 direta em registrador, sem `gather` na LUT, e corta o calculo assim que a soma parcial ja passa do pior do `top-5`.
   - O scan de listas agora escolhe o caminho SIMD uma vez por request e reutiliza a query pre-carregada no loop, evitando decisao de ISA e recarga da query a cada vetor no hot path.
   - O erro residual relevante vinha da representacao dos vetores, nao mais do algoritmo aproximado de busca.
   - Em x86, o hot path de distancia usa SIMD AVX2 com fallback scalar em outras arquiteturas.
@@ -60,19 +56,15 @@ Este arquivo existe para acelerar handoff entre agentes. Ele resume a arquitetur
 - [src/common.h](./src/common.h)
   - Parametros globais do indice, dimensao do vetor e `rinha_clamp01`.
   - Estado atual importante:
-    - `RINHA_FEATURE_DIM = 14`
-    - `RINHA_DIM = 16`
-    - `RINHA_IVF_NLIST = 2048`
+    - `RINHA_IVF_NLIST = 1024`
     - `RINHA_IVF_NPROBE = 4`
     - `RINHA_IVF_TRAIN_SAMPLES = 131072`
     - `RINHA_IVF_KMEANS_ITERS = 16`
     - `RINHA_IVF_BLOCK_SIZE = 64`
-  - O armazenamento interno agora usa padding de `14 -> 16` dimensoes e um layout fisico reordenado para aproximar o `early-exit` do caminho scalar e alinhar o caminho AVX2 em `8 + 8`.
 
 - [src/quantize.c](./src/quantize.c)
   - Quantizacao/dequantizacao dos vetores armazenados no indice.
   - Vetores persistidos em `uint16_t` via `rinha_vector_scalar_t`.
-  - No preprocess, o dataset oficial continua sendo lido com `14` features logicas; o padding para `16` acontece apenas no armazenamento interno do indice.
 
 - [src/time_utils.c](./src/time_utils.c)
   - Helpers de calendario usados pela vetorizacao.
@@ -109,12 +101,12 @@ Ultima rodada forte validada no ambiente equivalente ao oficial em Mac:
 - plataforma: `linux/arm64/v8`
 - limites preservados do ambiente oficial: `1 CPU` e `350 MB`
 - resultado em [test/results.json](./test/results.json):
-  - `p99 = 2.06ms`
+  - `p99 = 1.83ms`
   - `http_errors = 0`
   - `false_positive_detections = 0`
   - `false_negative_detections = 0`
   - `failure_rate = 0%` no relatorio arredondado
-  - `final_score = 5685.08`
+  - `final_score = 5737.79`
 
 Imagem local validada apos essa rodada:
 - `rinha-2026-local`
@@ -148,32 +140,6 @@ Importante:
   - `curl -sS -D - -o /dev/null http://localhost:9999/ready`
   - `curl -sS -D - -H "Content-Type: application/json" --data-raw @payload.json http://localhost:9999/fraud-score`
 
-## Telemetria da API
-
-- A API agora aceita profiler opcional por ambiente:
-  - `RINHA_API_PROFILE=1`
-  - `RINHA_API_PROFILE_EVERY=1000`
-- O compose base faz passthrough dessas envs em [docker-compose.yml](./docker-compose.yml).
-- O profiler escreve em `stderr` agregados com:
-  - `avg_request_recv_us`: tempo medio desde o primeiro `recv` concluido ate a request ficar completa
-  - `avg_parse_us`: tempo medio gasto dentro de `api_parse_http_request`
-  - `avg_handle_business_us`: tempo medio gasto dentro de `api_handle_business`
-  - `avg_payload_parse_us`, `avg_vectorize_us`, `avg_index_us` e `avg_finalize_us` para quebrar `handle business`
-  - `handle_vs_recv`: razao entre processamento e recebimento
-  - `avg_recv_ops` e `avg_request_bytes`
-- Medicao local em `macOS` com `docker-compose.yml` + `docker-compose.macos.yml` e `k6 run --vus 32 --iterations 400 test/smoke.js`:
-  - `api1` em `400` requests: `avg_request_recv_us=1.52`, `avg_parse_us=1.42`, `avg_handle_business_us=108.26`, `handle_vs_recv=71.35x`
-  - `api2` em `400` requests: `avg_request_recv_us=0.43`, `avg_parse_us=0.35`, `avg_handle_business_us=58.61`, `handle_vs_recv=136.10x`
-  - nas duas APIs, `avg_recv_ops=1.00` e `avg_request_bytes=600.00`
-- Leitura pratica:
-  - no fluxo interno atual por unix socket, a request quase sempre chega inteira em um unico `recv`
-  - o custo de parse e muito pequeno
-  - o custo dominante da API continua sendo `handle business`, varias dezenas a mais de `100x` maior que o tempo de recebimento/parsing
-  - dentro de `handle business`, a consulta ao indice domina quase tudo:
-    - `api1` em `400` requests: `avg_handle_business_us=52.29`, com `avg_index_us=50.99`
-    - `api2` em `400` requests: `avg_handle_business_us=46.16`, com `avg_index_us=45.01`
-  - isso coloca `avg_index_us` em ~`97.5%` do tempo de `handle business` nas duas APIs
-
 ## Telemetria do Indice
 
 - O indice agora aceita profiler opcional por ambiente:
@@ -181,9 +147,7 @@ Importante:
   - `RINHA_INDEX_PROFILE_EVERY=1000`
 - Quando habilitado, cada processo de API escreve em `stderr` um agregado com:
   - tempo medio por fase da `rinha_index_fraud_count_top5`
-  - detalhamento do scan em `probe_prepare`, `probe_kernel`, `candidate_prepare` e `candidate_kernel`
   - listas escaneadas e podadas
-  - blocos escaneados e podados nas probe lists e nas candidate lists
   - vetores escaneados nas probe lists e nas candidate lists
 - O custo quando desligado fica baixo; o caminho padrao continua sem telemetria.
 - Ultima comparacao util com a telemetria:
@@ -196,27 +160,12 @@ Importante:
   - em `linux/arm64/v8` no Mac, a ordem de acumulacao do kernel escalar em `rinha_distance_sq_scalar_preloaded` importa bastante para o `early-exit`
   - comparacao A/B em regime aquecido (`~200` calls por API) mostrou que a ordem reordenada derrubou o `probe_scan` de ~`82.95us`-`94.91us` para ~`60.06us`-`64.90us`, mantendo ~`8085` vetores nas probe lists
   - a mesma mudanca tambem reduziu `candidate_scan` de ~`21.17us`-`24.50us` para ~`14.06us`-`15.57us`
-  - profile detalhado da busca em `400` calls por API:
-    - `api1`: `avg_total_us=72.25`, `avg_plan_us=7.39`, `avg_probe_scan_us=50.60`, `avg_probe_prepare_us=0.37`, `avg_probe_kernel_us=49.77`, `avg_candidate_build_us=2.20`, `avg_candidate_sort_us=0.70`, `avg_candidate_scan_us=10.58`, `avg_candidate_prepare_us=2.18`, `avg_candidate_kernel_us=6.53`
-    - `api2`: `avg_total_us=72.94`, `avg_plan_us=8.21`, `avg_probe_scan_us=50.43`, `avg_probe_prepare_us=0.40`, `avg_probe_kernel_us=49.59`, `avg_candidate_build_us=2.40`, `avg_candidate_sort_us=0.78`, `avg_candidate_scan_us=10.48`, `avg_candidate_prepare_us=2.22`, `avg_candidate_kernel_us=6.45`
-  - leitura pratica do profile detalhado:
-    - o maior gargalo interno da busca e `probe_kernel`, isto e, o calculo efetivo de distancia dentro das `probe lists`
-    - `probe_prepare` e pequeno, na faixa de ~`0.37us`-`0.40us`
-    - `candidate_kernel` tambem pesa, mas bem menos, na faixa de ~`6.45us`-`6.53us`
-    - o scan de probe listas passa por ~`127` blocos escaneados e ~`7` blocos podados por request; o scan de candidate listas passa por ~`28` blocos escaneados e praticamente nao poda blocos nesse cenario
-  - retuning posterior para `NLIST=2048` melhorou a busca em `linux/arm64/v8` no Mac:
-    - `api1`: `avg_total_us=56.60`, `avg_plan_us=16.38`, `avg_probe_scan_us=22.70`, `avg_probe_kernel_us=21.88`, `avg_candidate_scan_us=10.82`
-    - `api2`: `avg_total_us=52.32`, `avg_plan_us=15.81`, `avg_probe_scan_us=21.53`, `avg_probe_kernel_us=20.82`, `avg_candidate_scan_us=8.79`
-    - o volume medio caiu para ~`4436` vetores por request, sendo ~`3452` nas `probe lists` e ~`984` nas `candidate lists`
-    - o custo de `plan` subiu por haver `2048` centroides, mas o ganho no `probe_kernel` compensou com folga
-  - padding posterior de `14 -> 16` dimensoes com layout fisico reordenado manteve a corretude funcional (`0` falsos positivos, `0` falsos negativos), mas no Mac `arm64` nao mostrou ganho claro fim a fim: o profile curto do indice ficou praticamente no mesmo patamar do baseline `NLIST=2048`, enquanto a rodada completa medida subiu para `p99 = 2.06ms`
 
 ## Telemetria do Load Balancer
 
 - O `LB` agora aceita profiler opcional por ambiente:
   - `RINHA_LB_PROFILE=1`
   - `RINHA_LB_PROFILE_EVERY=50`
-  - `RINHA_LB_BACKEND_POOL_SIZE=16` por padrao; `0` desliga o pool
 - O compose base faz passthrough dessas envs em [docker-compose.yml](/Users/viniciusfonseca/projects/rinha-2026/docker-compose.yml).
 - O profiler escreve em `stderr` agregados com:
   - sessoes abertas/fechadas/ativas
@@ -237,21 +186,6 @@ Importante:
   - nesse cenario com keep-alive, o `LB` nao apareceu gargalando em `connect` nem em `write`
   - o tempo dominante visto pelo `LB` e espera por dados (`read`), principalmente do backend
   - isso sugere que o gargalo observado em carga curta estava mais em espera pelo processamento/resposta da API do que em custo interno do `LB`
-
-- Medicao da primeira versao do pool quente de backends:
-  - com `RINHA_LB_BACKEND_POOL_SIZE=16`, o profiler mostrou `pool_hits=100%`, `pool_misses=0` e `avg_connect_us=0`, movendo o custo para `avg_pool_connect_us ~25us`
-  - em benchmark sequencial com `100` requests `Connection: close`, o tempo ficou praticamente igual ao baseline sem pool, em torno de `160ms` por rodada de `100` requests
-  - em benchmark paralelo agressivo com `Connection: close`, tanto com pool quanto sem pool a medicao entrou no mesmo platô de timeout de `5s`
-  - conclusao daquela versao: o pool aquecia o caminho de conexao, mas ainda nao reciclava a mesma conexao entre sessoes
-
-- Medicao da versao com reuso real entre sessoes:
-  - com `RINHA_LB_BACKEND_POOL_SIZE=16`, `500` requests sequenciais com `Connection: close` geraram `pool_hits=500`, `pool_misses=0`, `connect_ops=0` e `pool_connect_ops=32`
-  - `pool_connect_ops=32` corresponde exatamente ao aquecimento inicial de `16` sockets para cada uma das `2` APIs; depois disso nao houve reconnect por request
-  - benchmark sequencial aquecido com `100` requests `Connection: close`:
-    - `pool=0`: ~`162.5ms` por rodada de `100`
-    - `pool=16` com reuso: ~`159.75ms` por rodada de `100`
-  - ganho observado: cerca de `1.7%` no melhor comparativo aquecido local
-  - leitura pratica: o reuso elimina `connect` por request e reduz syscalls, mas o ganho end-to-end ainda e limitado porque o maior tempo do LB continua sendo espera de `read` no backend, na faixa de ~`70us` por operacao
 
 ## Compose e Ambientes
 
