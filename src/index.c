@@ -187,53 +187,29 @@ static inline float rinha_distance_sq_scalar_preloaded(
     const float *decode,
     float cutoff
 ) {
-    float diff2 = query2 - decode[vector[2]];
-    float diff6 = query6 - decode[vector[6]];
-    float diff12 = query12 - decode[vector[12]];
-    float diff5 = query5 - decode[vector[5]];
-    float diff11 = query11 - decode[vector[11]];
-    float diff8 = query8 - decode[vector[8]];
-    float diff7 = query7 - decode[vector[7]];
     float diff0 = query0 - decode[vector[0]];
-    float diff13 = query13 - decode[vector[13]];
-    float diff9 = query9 - decode[vector[9]];
-    float diff10 = query10 - decode[vector[10]];
+    float diff1 = query1 - decode[vector[1]];
+    float diff2 = query2 - decode[vector[2]];
     float diff3 = query3 - decode[vector[3]];
     float diff4 = query4 - decode[vector[4]];
-    float diff1 = query1 - decode[vector[1]];
+    float diff5 = query5 - decode[vector[5]];
+    float diff6 = query6 - decode[vector[6]];
+    float diff7 = query7 - decode[vector[7]];
+    float diff8 = query8 - decode[vector[8]];
+    float diff9 = query9 - decode[vector[9]];
+    float diff10 = query10 - decode[vector[10]];
+    float diff11 = query11 - decode[vector[11]];
+    float diff12 = query12 - decode[vector[12]];
+    float diff13 = query13 - decode[vector[13]];
     float sum = 0.0f;
-    diff2 *= diff2;
-    sum += diff2;
-    if (sum >= cutoff) return sum;
-    diff6 *= diff6;
-    sum += diff6;
-    if (sum >= cutoff) return sum;
-    diff12 *= diff12;
-    sum += diff12;
-    if (sum >= cutoff) return sum;
-    diff5 *= diff5;
-    sum += diff5;
-    if (sum >= cutoff) return sum;
-    diff11 *= diff11;
-    sum += diff11;
-    if (sum >= cutoff) return sum;
-    diff8 *= diff8;
-    sum += diff8;
-    if (sum >= cutoff) return sum;
-    diff7 *= diff7;
-    sum += diff7;
-    if (sum >= cutoff) return sum;
     diff0 *= diff0;
     sum += diff0;
     if (sum >= cutoff) return sum;
-    diff13 *= diff13;
-    sum += diff13;
+    diff1 *= diff1;
+    sum += diff1;
     if (sum >= cutoff) return sum;
-    diff9 *= diff9;
-    sum += diff9;
-    if (sum >= cutoff) return sum;
-    diff10 *= diff10;
-    sum += diff10;
+    diff2 *= diff2;
+    sum += diff2;
     if (sum >= cutoff) return sum;
     diff3 *= diff3;
     sum += diff3;
@@ -241,8 +217,32 @@ static inline float rinha_distance_sq_scalar_preloaded(
     diff4 *= diff4;
     sum += diff4;
     if (sum >= cutoff) return sum;
-    diff1 *= diff1;
-    sum += diff1;
+    diff5 *= diff5;
+    sum += diff5;
+    if (sum >= cutoff) return sum;
+    diff6 *= diff6;
+    sum += diff6;
+    if (sum >= cutoff) return sum;
+    diff7 *= diff7;
+    sum += diff7;
+    if (sum >= cutoff) return sum;
+    diff8 *= diff8;
+    sum += diff8;
+    if (sum >= cutoff) return sum;
+    diff9 *= diff9;
+    sum += diff9;
+    if (sum >= cutoff) return sum;
+    diff10 *= diff10;
+    sum += diff10;
+    if (sum >= cutoff) return sum;
+    diff11 *= diff11;
+    sum += diff11;
+    if (sum >= cutoff) return sum;
+    diff12 *= diff12;
+    sum += diff12;
+    if (sum >= cutoff) return sum;
+    diff13 *= diff13;
+    sum += diff13;
     return sum;
 }
 
@@ -278,13 +278,6 @@ static float rinha_reduce_m256(__m256 value) {
 }
 
 __attribute__((target("avx2")))
-static float rinha_reduce_m128(__m128 value) {
-    value = _mm_hadd_ps(value, value);
-    value = _mm_hadd_ps(value, value);
-    return _mm_cvtss_f32(value);
-}
-
-__attribute__((target("avx2")))
 static __m256 rinha_decode8_avx2(const rinha_vector_scalar_t *vector) {
     const __m256 scale = _mm256_set1_ps(1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
     const __m256 missing_value = _mm256_set1_ps(-1.0f);
@@ -298,76 +291,33 @@ static __m256 rinha_decode8_avx2(const rinha_vector_scalar_t *vector) {
 }
 
 __attribute__((target("avx2")))
-static __m128 rinha_decode4_avx2(const rinha_vector_scalar_t *vector) {
-    const __m128 scale = _mm_set1_ps(1.0f / (float) RINHA_VECTOR_QUANT_SCALE);
-    const __m128 missing_value = _mm_set1_ps(-1.0f);
-    const __m128i missing = _mm_set1_epi32((int) RINHA_VECTOR_QUANT_MISSING);
-
-    __m128i packed = _mm_loadl_epi64((const __m128i *) vector);
-    __m128i values_i32 = _mm_cvtepu16_epi32(packed);
-    __m128 values = _mm_mul_ps(_mm_cvtepi32_ps(values_i32), scale);
-    __m128 mask = _mm_castsi128_ps(_mm_cmpeq_epi32(values_i32, missing));
-    return _mm_blendv_ps(values, missing_value, mask);
-}
-
-__attribute__((target("avx2")))
 static float rinha_distance_sq_avx2_preloaded(
     __m256 query0,
-    __m128 query1,
-    float query12,
-    float query13,
+    __m256 query1,
     const rinha_vector_scalar_t *vector,
     float cutoff
 ) {
     __m256 values0 = rinha_decode8_avx2(vector);
     __m256 diff0 = _mm256_sub_ps(query0, values0);
     __m256 sum0 = _mm256_mul_ps(diff0, diff0);
-    __m128 values1 = rinha_decode4_avx2(vector + 8);
-    __m128 diff1 = _mm_sub_ps(query1, values1);
-    __m128 sum1 = _mm_mul_ps(diff1, diff1);
-    __m128 low0 = _mm256_castps256_ps128(sum0);
-    __m128 high0 = _mm256_extractf128_ps(sum0, 1);
-
-    float partial0 =
-        _mm_cvtss_f32(_mm_shuffle_ps(low0, low0, _MM_SHUFFLE(2, 2, 2, 2))) +
-        _mm_cvtss_f32(_mm_shuffle_ps(high0, high0, _MM_SHUFFLE(2, 2, 2, 2))) +
-        _mm_cvtss_f32(_mm_shuffle_ps(high0, high0, _MM_SHUFFLE(1, 1, 1, 1)));
-    float diff12 = query12 - rinha_dequantize_scalar(vector[12]);
-    partial0 += diff12 * diff12;
+    float partial0 = rinha_reduce_m256(sum0);
     if (partial0 >= cutoff) {
         return partial0;
     }
 
-    float partial1 = partial0 +
-        _mm_cvtss_f32(_mm_shuffle_ps(sum1, sum1, _MM_SHUFFLE(3, 3, 3, 3))) +
-        _mm_cvtss_f32(sum1) +
-        _mm_cvtss_f32(_mm_shuffle_ps(high0, high0, _MM_SHUFFLE(3, 3, 3, 3))) +
-        _mm_cvtss_f32(low0);
-    if (partial1 >= cutoff) {
-        return partial1;
-    }
-
-    float diff13 = query13 - rinha_dequantize_scalar(vector[13]);
-    return partial1 +
-        diff13 * diff13 +
-        _mm_cvtss_f32(_mm_shuffle_ps(sum1, sum1, _MM_SHUFFLE(1, 1, 1, 1))) +
-        _mm_cvtss_f32(_mm_shuffle_ps(sum1, sum1, _MM_SHUFFLE(2, 2, 2, 2))) +
-        _mm_cvtss_f32(_mm_shuffle_ps(low0, low0, _MM_SHUFFLE(3, 3, 3, 3))) +
-        _mm_cvtss_f32(high0) +
-        _mm_cvtss_f32(_mm_shuffle_ps(low0, low0, _MM_SHUFFLE(1, 1, 1, 1)));
+    __m256 values1 = rinha_decode8_avx2(vector + 8);
+    __m256 diff1 = _mm256_sub_ps(query1, values1);
+    __m256 sum1 = _mm256_mul_ps(diff1, diff1);
+    return partial0 + rinha_reduce_m256(sum1);
 }
 
 __attribute__((target("avx2")))
 static float rinha_distance_sq_float_avx2(const float *lhs, const float *rhs) {
     __m256 diff0 = _mm256_sub_ps(_mm256_loadu_ps(lhs), _mm256_loadu_ps(rhs));
     __m256 sum0 = _mm256_mul_ps(diff0, diff0);
-
-    __m128 diff1 = _mm_sub_ps(_mm_loadu_ps(lhs + 8), _mm_loadu_ps(rhs + 8));
-    __m128 sum1 = _mm_mul_ps(diff1, diff1);
-
-    float diff12 = lhs[12] - rhs[12];
-    float diff13 = lhs[13] - rhs[13];
-    return rinha_reduce_m256(sum0) + rinha_reduce_m128(sum1) + diff12 * diff12 + diff13 * diff13;
+    __m256 diff1 = _mm256_sub_ps(_mm256_loadu_ps(lhs + 8), _mm256_loadu_ps(rhs + 8));
+    __m256 sum1 = _mm256_mul_ps(diff1, diff1);
+    return rinha_reduce_m256(sum0) + rinha_reduce_m256(sum1);
 }
 #endif
 
@@ -685,9 +635,7 @@ static uint32_t rinha_scan_window_avx2(
     const float *block_min_radii = index->block_min_radii;
     const float *block_max_radii = index->block_max_radii;
     __m256 query0 = _mm256_loadu_ps(query);
-    __m128 query1 = _mm_loadu_ps(query + 8);
-    float query12 = query[12];
-    float query13 = query[13];
+    __m256 query1 = _mm256_loadu_ps(query + 8);
     uint32_t scanned = 0u;
     for (uint32_t block = window->candidate_block_begin; block < window->candidate_block_end; block++) {
         if (best_dist[4] < FLT_MAX) {
@@ -708,7 +656,7 @@ static uint32_t rinha_scan_window_avx2(
         scanned += item_end - item_start;
         for (uint32_t item = item_start; item < item_end; item++) {
             const rinha_vector_scalar_t *vector = vectors + (size_t) item * RINHA_DIM;
-            float exact_distance = rinha_distance_sq_avx2_preloaded(query0, query1, query12, query13, vector, best_dist[4]);
+            float exact_distance = rinha_distance_sq_avx2_preloaded(query0, query1, vector, best_dist[4]);
             if (exact_distance < best_dist[4]) {
                 rinha_insert_top5(best_dist, best_label, exact_distance, labels[item]);
             }

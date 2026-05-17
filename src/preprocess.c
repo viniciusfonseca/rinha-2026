@@ -120,6 +120,28 @@ static uint64_t rinha_xorshift64(uint64_t *state) {
     return x;
 }
 
+static void rinha_pack_vector(
+    const float features[RINHA_FEATURE_DIM],
+    rinha_vector_scalar_t vector[RINHA_DIM]
+) {
+    vector[RINHA_SLOT_AMOUNT_RATIO] = rinha_quantize_scalar(features[2]);
+    vector[RINHA_SLOT_KM_FROM_CURRENT] = rinha_quantize_scalar(features[6]);
+    vector[RINHA_SLOT_MCC_RISK] = rinha_quantize_scalar(features[12]);
+    vector[RINHA_SLOT_MINUTES_SINCE_LAST] = rinha_quantize_scalar(features[5]);
+    vector[RINHA_SLOT_MERCHANT_UNKNOWN] = rinha_quantize_scalar(features[11]);
+    vector[RINHA_SLOT_TX_COUNT_24H] = rinha_quantize_scalar(features[8]);
+    vector[RINHA_SLOT_KM_FROM_HOME] = rinha_quantize_scalar(features[7]);
+    vector[RINHA_SLOT_AMOUNT] = rinha_quantize_scalar(features[0]);
+    vector[RINHA_SLOT_MERCHANT_AVG_AMOUNT] = rinha_quantize_scalar(features[13]);
+    vector[RINHA_SLOT_IS_ONLINE] = rinha_quantize_scalar(features[9]);
+    vector[RINHA_SLOT_CARD_PRESENT] = rinha_quantize_scalar(features[10]);
+    vector[RINHA_SLOT_REQUEST_HOUR] = rinha_quantize_scalar(features[3]);
+    vector[RINHA_SLOT_REQUEST_WEEKDAY] = rinha_quantize_scalar(features[4]);
+    vector[RINHA_SLOT_INSTALLMENTS] = rinha_quantize_scalar(features[1]);
+    vector[RINHA_SLOT_PADDING0] = rinha_quantize_scalar(0.0);
+    vector[RINHA_SLOT_PADDING1] = rinha_quantize_scalar(0.0);
+}
+
 static void rinha_decode_vector(const rinha_vector_scalar_t *vector, float out[RINHA_DIM]) {
     const float *decode = rinha_dequantize_lut();
     for (size_t dim = 0; dim < RINHA_DIM; dim++) {
@@ -336,10 +358,12 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        rinha_vector_scalar_t *vector = vectors + (size_t) count * RINHA_DIM;
-        for (size_t dim = 0; dim < RINHA_DIM; dim++) {
-            vector[dim] = rinha_quantize_scalar(rinha_reader_number(&reader));
+        float features[RINHA_FEATURE_DIM];
+        for (size_t dim = 0; dim < RINHA_FEATURE_DIM; dim++) {
+            features[dim] = (float) rinha_reader_number(&reader);
         }
+        rinha_vector_scalar_t *vector = vectors + (size_t) count * RINHA_DIM;
+        rinha_pack_vector(features, vector);
 
         if (rinha_reader_skip_to(&reader, ':') == EOF || rinha_reader_string(&reader, label_text, sizeof(label_text)) != 0) {
             fprintf(stderr, "label nao encontrada\n");

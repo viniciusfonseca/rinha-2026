@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define RINHA_INDEX_MAGIC "R26IV10"
-#define RINHA_INDEX_VERSION 10u
+#define RINHA_INDEX_MAGIC "R26IV11"
+#define RINHA_INDEX_VERSION 11u
 
 typedef struct {
     char magic[8];
