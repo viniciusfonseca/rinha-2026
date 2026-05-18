@@ -61,6 +61,62 @@ typedef struct {
 
 static rinha_index_profile_t rinha_index_profile = {0};
 
+// Nova função: lower bound a partir da distância real (não quadrada)
+static inline float rinha_list_lower_bound_sq_from_dist(float centroid_dist, float radius) {
+    if (centroid_dist <= radius) {
+        return 0.0f;
+    }
+    float lower_bound = centroid_dist - radius;
+    return lower_bound * lower_bound;
+}
+
+static void heap_push_max(rinha_list_bound_t heap[], size_t *size, size_t capacity,
+                          float centroid_dist_sq, uint32_t list) {
+    if (*size < capacity) {
+        // sobe o novo elemento
+        size_t i = (*size)++;
+        while (i > 0) {
+            size_t parent = (i - 1) / 2;
+            if (centroid_dist_sq <= heap[parent].centroid_dist_sq) break;
+            heap[i] = heap[parent];
+            i = parent;
+        }
+        heap[i].centroid_dist_sq = centroid_dist_sq;
+        heap[i].list = list;
+    } else if (centroid_dist_sq < heap[0].centroid_dist_sq) {
+        // substitui a raiz (maior) e desce
+        size_t i = 0;
+        while (1) {
+            size_t left = 2 * i + 1;
+            size_t right = 2 * i + 2;
+            size_t largest = i;
+            if (left < capacity && heap[left].centroid_dist_sq > heap[largest].centroid_dist_sq)
+                largest = left;
+            if (right < capacity && heap[right].centroid_dist_sq > heap[largest].centroid_dist_sq)
+                largest = right;
+            if (largest == i) break;
+            rinha_list_bound_t tmp = heap[i];
+            heap[i] = heap[largest];
+            heap[largest] = tmp;
+            i = largest;
+        }
+        heap[0].centroid_dist_sq = centroid_dist_sq;
+        heap[0].list = list;
+    }
+}
+
+static int cmp_bound_desc(const void *a, const void *b) {
+    float fa = ((const rinha_list_bound_t *)a)->centroid_dist_sq;
+    float fb = ((const rinha_list_bound_t *)b)->centroid_dist_sq;
+    return (fa > fb) - (fa < fb);
+}
+
+static int cmp_candidate_asc(const void *a, const void *b) {
+    float fa = ((const rinha_list_candidate_t *)a)->lower_bound_sq;
+    float fb = ((const rinha_list_candidate_t *)b)->lower_bound_sq;
+    return (fa > fb) - (fa < fb);
+}
+
 static bool rinha_env_truthy(const char *value) {
     if (value == NULL || value[0] == '\0') {
         return false;
@@ -451,23 +507,17 @@ static size_t rinha_plan_probe_lists(
     float centroid_dist_sq[RINHA_IVF_NLIST],
     rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE]
 ) {
-    size_t probe_count = 0;
+    size_t heap_size = 0;
     for (uint32_t list = 0; list < index->nlist; list++) {
-        const float *centroid = index->coarse_centroids + (size_t) list * RINHA_DIM;
+        const float *centroid = index->coarse_centroids + (size_t)list * RINHA_DIM;
         float dist_sq = rinha_distance_sq_float(query, centroid, RINHA_DIM);
         centroid_dist_sq[list] = dist_sq;
-
-        if (probe_count < index->nprobe) {
-            rinha_insert_probe_list(probe_lists, probe_count, dist_sq, list);
-            probe_count++;
-            continue;
-        }
-        if (dist_sq >= probe_lists[probe_count - 1u].centroid_dist_sq) {
-            continue;
-        }
-        rinha_insert_probe_list(probe_lists, probe_count - 1u, dist_sq, list);
+        heap_push_max(probe_lists, &heap_size, index->nprobe, dist_sq, list);
     }
-    return probe_count;
+    // Ao final, o heap contém os nprobe elementos com as menores distâncias.
+    // Precisamos ordená-los para a varredura (ordem crescente de distância).
+    qsort(probe_lists, index->nprobe, sizeof(rinha_list_bound_t), cmp_bound_desc);
+    return index->nprobe;
 }
 
 static uint32_t rinha_find_first_block_with_max_ge(
@@ -716,6 +766,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
     bool use_avx2 = false;
 #endif
     float centroid_dist_sq[RINHA_IVF_NLIST];
+    float centroid_dist[RINHA_IVF_NLIST];   // <--- pré‑cálculo das raízes
     rinha_list_bound_t probe_lists[RINHA_IVF_NPROBE];
     rinha_list_candidate_t candidate_lists[RINHA_IVF_NLIST - RINHA_IVF_NPROBE];
     bool selected_lists[RINHA_IVF_NLIST] = {false};
@@ -724,6 +775,11 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         phase_start_ns = rinha_now_ns();
     }
     size_t probe_count = rinha_plan_probe_lists(index, query, centroid_dist_sq, probe_lists);
+    // Pré‑calcula raiz quadrada de todas as distâncias (uma única vez)
+    for (uint32_t i = 0; i < index->nlist; i++) {
+        centroid_dist[i] = sqrtf(centroid_dist_sq[i]);
+    }
+    
     if (profile_enabled) {
         plan_ns = rinha_now_ns() - phase_start_ns;
         phase_start_ns = rinha_now_ns();
@@ -741,27 +797,28 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         }
         uint32_t list = probe_lists[i].list;
         selected_lists[list] = true;
-        float centroid_dist = sqrtf(probe_lists[i].centroid_dist_sq);
-        float lower_bound_sq = rinha_list_lower_bound_sq_for_distance(centroid_dist, index->list_radii[list]);
+        float dist = centroid_dist[list];
+        float lower_bound_sq = rinha_list_lower_bound_sq_from_dist(dist, index->list_radii[list]);
         if (lower_bound_sq >= best_dist[4]) {
             probe_lists_pruned_bound++;
             continue;
         }
         probe_lists_scanned++;
-        vectors_scanned_probe += rinha_scan_list(index, query, decode, list, centroid_dist, use_avx2, best_dist, best_label);
+        vectors_scanned_probe += rinha_scan_list(index, query, decode, list, dist, use_avx2, best_dist, best_label);
     }
+
     if (profile_enabled) {
         probe_scan_ns = rinha_now_ns() - phase_start_ns;
         phase_start_ns = rinha_now_ns();
     }
 
-    size_t candidate_count = 0u;
+    size_t candidate_count = 0;
     float prune_distance = best_dist[4] < FLT_MAX ? sqrtf(best_dist[4]) : FLT_MAX;
     for (uint32_t list = 0; list < index->nlist; list++) {
-        if (selected_lists[list]) {
-            continue;
-        }
+        if (selected_lists[list]) continue;
         candidate_lists_considered++;
+
+        // Poda por raio
         if (prune_distance < FLT_MAX) {
             float max_centroid_dist = prune_distance + index->list_radii[list];
             if (centroid_dist_sq[list] >= max_centroid_dist * max_centroid_dist) {
@@ -769,15 +826,22 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
                 continue;
             }
         }
-        float lower_bound_sq = rinha_list_lower_bound_sq(centroid_dist_sq[list], index->list_radii[list]);
+
+        // Calcula lower bound usando a distância pré‑calculada
+        float lower_bound_sq = rinha_list_lower_bound_sq_from_dist(centroid_dist[list], index->list_radii[list]);
         if (lower_bound_sq >= best_dist[4]) {
             candidate_lists_pruned_bound++;
             continue;
         }
-        rinha_insert_candidate_list(candidate_lists, candidate_count, lower_bound_sq, list);
+
+        candidate_lists[candidate_count].lower_bound_sq = lower_bound_sq;
+        candidate_lists[candidate_count].list = list;
         candidate_count++;
         candidate_lists_selected++;
     }
+
+    qsort(candidate_lists, candidate_count, sizeof(rinha_list_candidate_t), cmp_candidate_asc);
+
     if (profile_enabled) {
         candidate_build_ns = rinha_now_ns() - phase_start_ns;
         phase_start_ns = rinha_now_ns();
@@ -787,6 +851,7 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         phase_start_ns = rinha_now_ns();
     }
 
+    // Varredura dos candidatos
     for (size_t i = 0; i < candidate_count; i++) {
         if (candidate_lists[i].lower_bound_sq >= best_dist[4]) {
             candidate_lists_skipped_after_sort += candidate_count - i;
@@ -794,9 +859,9 @@ int rinha_index_fraud_count_top5(rinha_index_t *index, const float query[RINHA_D
         }
         candidate_lists_scanned++;
         uint32_t list = candidate_lists[i].list;
-        float centroid_dist = sqrtf(centroid_dist_sq[list]);
-        vectors_scanned_candidate += rinha_scan_list(index, query, decode, list, centroid_dist, use_avx2, best_dist, best_label);
+        vectors_scanned_candidate += rinha_scan_list(index, query, decode, list, centroid_dist[list], use_avx2, best_dist, best_label);
     }
+
     if (profile_enabled) {
         candidate_scan_ns = rinha_now_ns() - phase_start_ns;
     }
